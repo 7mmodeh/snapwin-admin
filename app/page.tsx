@@ -1,98 +1,144 @@
 // app/page.tsx
 import Image from "next/image";
 import Link from "next/link";
-import { COLORS } from "@/lib/colors";
 import { createClient } from "@supabase/supabase-js";
+import { COLORS } from "@/lib/colors";
 
-export const revalidate = 30; // seconds – landing auto-refreshes every ~30s
+export const revalidate = 30;
 
-type Raffle = {
+type RaffleStatus = "active" | "soldout" | "drawn" | "cancelled";
+
+type PublicRaffleLite = {
   id: string;
   item_name: string;
+  item_description: string | null;
+  item_image_url: string | null;
+  ticket_price: number; // numeric in DB
+  total_tickets: number;
+  sold_tickets: number;
+  status: RaffleStatus;
+  draw_date: string | null;
+  created_at: string;
+};
+
+// Raw row shape from Supabase for the landing page queries
+type RaffleRow = {
+  id: string;
+  item_name: string;
+  item_description: string | null;
+  item_image_url: string | null;
   ticket_price: number;
   total_tickets: number;
   sold_tickets: number;
-  status: string;
+  status: RaffleStatus;
   draw_date: string | null;
+  created_at: string;
 };
+
+type SoldRow = { sold_tickets: number | null };
+
+function safeNumber(v: unknown, fallback = 0) {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function formatEuro(n: number) {
+  return new Intl.NumberFormat("en-IE", {
+    style: "currency",
+    currency: "EUR",
+  }).format(n);
+}
+
+function formatDateShort(drawDate: string | null) {
+  if (!drawDate) return "To be announced";
+  const d = new Date(drawDate);
+  return d.toLocaleString("en-IE", {
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
 
 export default async function Home() {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
-  let raffles: Raffle[] | null = null;
+  let latestActive: PublicRaffleLite | null = null;
+  let activeRaffles: PublicRaffleLite[] = [];
+  let activeCount = 0;
+  let totalTicketsSoldAll = 0;
+  let completedDraws = 0;
 
+  // If env is missing, page still renders (no hard crash).
   if (supabaseUrl && supabaseAnonKey) {
     const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
-    const { data, error } = await supabase
+    // 1) Latest active raffles for hero + strip
+    const { data: activeData } = await supabase
       .from("raffles")
       .select(
-        "id, item_name, ticket_price, total_tickets, sold_tickets, status, draw_date"
+        "id,item_name,item_description,item_image_url,ticket_price,total_tickets,sold_tickets,status,draw_date,created_at"
       )
       .eq("status", "active")
       .order("created_at", { ascending: false })
       .limit(3);
 
-    if (!error && data) {
-      raffles = data;
+    if (activeData && Array.isArray(activeData)) {
+      activeRaffles = (activeData as RaffleRow[]).map((r) => ({
+        id: r.id,
+        item_name: r.item_name,
+        item_description: r.item_description,
+        item_image_url: r.item_image_url,
+        ticket_price: safeNumber(r.ticket_price, 0),
+        total_tickets: safeNumber(r.total_tickets, 0),
+        sold_tickets: safeNumber(r.sold_tickets, 0),
+        status: r.status ?? "active",
+        draw_date: r.draw_date,
+        created_at: r.created_at,
+      }));
+
+      latestActive = activeRaffles[0] ?? null;
+    }
+
+    // 2) Live counts (public-safe)
+    const { count: activeCountResult } = await supabase
+      .from("raffles")
+      .select("id", { count: "exact", head: true })
+      .eq("status", "active");
+    activeCount = activeCountResult ?? 0;
+
+    const { count: drawnCountResult } = await supabase
+      .from("raffles")
+      .select("id", { count: "exact", head: true })
+      .eq("status", "drawn");
+    completedDraws = drawnCountResult ?? 0;
+
+    // 3) Total tickets sold (sum in JS)
+    const { data: soldRows } = await supabase
+      .from("raffles")
+      .select("sold_tickets")
+      .limit(1000); // adjust if you expect >1000 raffles
+
+    if (soldRows && Array.isArray(soldRows)) {
+      totalTicketsSoldAll = (soldRows as SoldRow[]).reduce(
+        (acc, row) => acc + safeNumber(row.sold_tickets, 0),
+        0
+      );
     }
   }
 
-  const heroRaffle = raffles?.[0] ?? null;
-
-  const heroTicketsSold =
-    heroRaffle?.sold_tickets != null ? heroRaffle.sold_tickets : 381;
-  const heroTotalTickets =
-    heroRaffle?.total_tickets != null && heroRaffle.total_tickets > 0
-      ? heroRaffle.total_tickets
-      : 500;
-
+  // Hero mock fallback values (if no active raffle)
+  const heroTitle = latestActive?.item_name ?? "Flagship smartphone";
+  const heroPrice = latestActive?.ticket_price ?? 4.99;
+  const heroTotal = latestActive?.total_tickets ?? 500;
+  const heroSold = latestActive?.sold_tickets ?? 381;
   const heroProgress =
-    heroRaffle && heroTotalTickets > 0
-      ? Math.round((heroTicketsSold / heroTotalTickets) * 100)
-      : 76;
-
-  const heroTicketPrice =
-    heroRaffle?.ticket_price != null
-      ? `€${heroRaffle.ticket_price.toFixed(2)}`
-      : "€4.99";
-
-  const heroTitle = heroRaffle?.item_name ?? "Flagship smartphone";
-
-  const hasLive = raffles && raffles.length > 0;
-
-  const previewRaffles: Raffle[] | { id: string }[] = hasLive
-    ? raffles!
-    : [
-        {
-          id: "demo-1",
-          item_name: "Flagship smartphone",
-          ticket_price: 4.99,
-          total_tickets: 500,
-          sold_tickets: 361,
-          status: "demo",
-          draw_date: null,
-        },
-        {
-          id: "demo-2",
-          item_name: "Next-gen console",
-          ticket_price: 3.49,
-          total_tickets: 500,
-          sold_tickets: 240,
-          status: "demo",
-          draw_date: null,
-        },
-        {
-          id: "demo-3",
-          item_name: "Luxury watch",
-          ticket_price: 5.99,
-          total_tickets: 500,
-          sold_tickets: 150,
-          status: "demo",
-          draw_date: null,
-        },
-      ];
+    heroTotal > 0 ? clamp(Math.round((heroSold / heroTotal) * 100), 0, 100) : 0;
+  const heroDrawText = formatDateShort(latestActive?.draw_date ?? null);
 
   return (
     <main
@@ -126,7 +172,7 @@ export default async function Home() {
       />
 
       <div className="relative max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-10 space-y-16">
-        {/* Top nav (normal, not sticky – just like you liked it) */}
+        {/* Top nav */}
         <header className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <div className="relative h-9 w-9 sm:h-10 sm:w-10 rounded-2xl overflow-hidden border border-white/60 shadow-md shadow-black/10 bg-white/70 backdrop-blur">
@@ -190,11 +236,12 @@ export default async function Home() {
           </nav>
         </header>
 
-        {/* HERO – premium, with live hero raffle */}
+        {/* HERO */}
         <section className="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-12 lg:gap-16 items-center">
-          {/* LEFT: realistic iPhone mockup (balanced size) */}
-          <div className="flex justify-center lg:justify-start">
-            <div className="relative w-full max-w-[13rem] sm:max-w-[15rem] lg:max-w-[16rem]">
+          {/* LEFT: iPhone mockup */}
+          <div className="flex justify-center lg:justify-start lg:items-center">
+            {/* iPhone wrapper tuned to be a bit shorter than hero copy */}
+            <div className="relative w-full max-w-[200px] sm:max-w-[240px] lg:max-w-[280px]">
               {/* Soft glow plate */}
               <div
                 className="absolute -inset-10 -z-10 rounded-[3.2rem] blur-3xl opacity-80"
@@ -211,12 +258,12 @@ export default async function Home() {
                     "linear-gradient(135deg, #fdfdfd, #d7d7d7, #f9f9f9)",
                 }}
               >
-                {/* Side button hints (power + volume) */}
+                {/* Side button hints */}
                 <div className="absolute -right-[2px] top-24 h-14 w-[3px] rounded-l-full bg-gradient-to-b from-zinc-400 to-zinc-500" />
                 <div className="absolute -left-[2px] top-20 h-8 w-[3px] rounded-r-full bg-gradient-to-b from-zinc-400 to-zinc-500" />
                 <div className="absolute -left-[2px] top-32 h-8 w-[3px] rounded-r-full bg-gradient-to-b from-zinc-400 to-zinc-500" />
 
-                {/* Inner bezel (glass) */}
+                {/* Inner bezel */}
                 <div
                   className="relative h-full w-full rounded-[2.6rem] overflow-hidden"
                   style={{
@@ -226,7 +273,7 @@ export default async function Home() {
                       "inset 0 0 0 1px rgba(255,255,255,0.07), inset 0 0 24px rgba(0,0,0,0.8)",
                   }}
                 >
-                  {/* Dynamic Island / notch */}
+                  {/* Dynamic Island */}
                   <div className="absolute top-2 left-1/2 -translate-x-1/2">
                     <div className="h-5 w-28 rounded-full bg-black/85 shadow-[0_4px_12px_rgba(0,0,0,0.75)] flex items-center justify-center gap-1 px-2">
                       <span className="h-1.5 w-10 rounded-full bg-zinc-700" />
@@ -245,7 +292,6 @@ export default async function Home() {
 
                   {/* Screen content */}
                   <div className="absolute inset-0 px-4 pt-7 pb-4 flex flex-col gap-3">
-                    {/* Status row */}
                     <div className="flex items-center justify-between text-[0.6rem] text-zinc-400">
                       <span className="flex items-center gap-1">
                         <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
@@ -255,61 +301,81 @@ export default async function Home() {
                     </div>
 
                     {/* Live raffle card */}
-                    <div
-                      className="rounded-2xl p-4 space-y-3 relative overflow-hidden"
-                      style={{
-                        background: `radial-gradient(circle at 0% 0%, rgba(255,255,255,0.2), transparent 55%), linear-gradient(150deg, ${COLORS.primary}, ${COLORS.secondary})`,
-                        color: COLORS.textOnPrimary,
-                      }}
-                    >
-                      <div className="absolute -bottom-8 -right-10 h-24 w-24 rounded-full opacity-30 blur-xl bg-white" />
+                    {latestActive ? (
+                      <Link
+                        href={`/public-raffles/${latestActive.id}`}
+                        className="block"
+                      >
+                        <div
+                          className="rounded-2xl p-4 space-y-3 relative overflow-hidden"
+                          style={{
+                            background: `radial-gradient(circle at 0% 0%, rgba(255,255,255,0.2), transparent 55%), linear-gradient(150deg, ${COLORS.primary}, ${COLORS.secondary})`,
+                            color: COLORS.textOnPrimary,
+                          }}
+                        >
+                          <div className="absolute -bottom-8 -right-10 h-24 w-24 rounded-full opacity-30 blur-xl bg-white" />
 
-                      <div className="flex items-center justify-between text-[0.7rem] opacity-95">
-                        <span>Featured raffle</span>
-                        <span>{heroTitle}</span>
-                      </div>
+                          <div className="flex items-center justify-between text-[0.7rem] opacity-95">
+                            <span>Featured raffle</span>
+                            <span>Live record</span>
+                          </div>
 
-                      <div className="flex items-center gap-3">
-                        <div className="relative h-10 w-10 rounded-2xl bg-black/25 flex items-center justify-center overflow-hidden">
-                          <Image
-                            src="/snapwin-logo.svg"
-                            alt="SnapWin logo"
-                            fill
-                            className="object-contain p-1.5"
-                          />
-                        </div>
-                        <div className="space-y-0.5">
-                          <p className="text-sm font-semibold leading-tight">
-                            {heroTitle}
-                          </p>
-                          <p className="text-[0.7rem] opacity-90">
-                            Limited entries · Verified draw
-                          </p>
-                        </div>
-                      </div>
+                          <div className="flex items-center gap-3">
+                            <div className="relative h-10 w-10 rounded-2xl bg-black/25 flex items-center justify-center overflow-hidden">
+                              <Image
+                                src="/snapwin-logo.svg"
+                                alt="SnapWin logo"
+                                fill
+                                className="object-contain p-1.5"
+                              />
+                            </div>
+                            <div className="space-y-0.5">
+                              <p className="text-sm font-semibold leading-tight">
+                                {heroTitle}
+                              </p>
+                              <p className="text-[0.7rem] opacity-90">
+                                Live progress · Verified draw
+                              </p>
+                            </div>
+                          </div>
 
-                      <div className="space-y-1.5">
-                        <div className="flex items-center justify-between text-[0.7rem] opacity-90">
-                          <span>Tickets sold</span>
-                          <span>{heroProgress}% filled</span>
+                          <div className="space-y-1.5">
+                            <div className="flex items-center justify-between text-[0.7rem] opacity-90">
+                              <span>Tickets sold</span>
+                              <span>{heroProgress}% filled</span>
+                            </div>
+                            <div className="w-full h-1.5 rounded-full bg-white/15 overflow-hidden">
+                              <div
+                                className="h-1.5 rounded-full"
+                                style={{
+                                  width: `${heroProgress}%`,
+                                  backgroundColor: COLORS.raffleSoldProgress,
+                                }}
+                              />
+                            </div>
+                            <div className="flex justify-between text-[0.65rem] opacity-90">
+                              <span>
+                                {heroSold} / {heroTotal} tickets
+                              </span>
+                              <span>{formatEuro(heroPrice)} / ticket</span>
+                            </div>
+                          </div>
                         </div>
-                        <div className="w-full h-1.5 rounded-full bg-white/15 overflow-hidden">
-                          <div
-                            className="h-1.5 rounded-full"
-                            style={{
-                              width: `${heroProgress}%`,
-                              backgroundColor: COLORS.raffleSoldProgress,
-                            }}
-                          />
+                      </Link>
+                    ) : (
+                      <div
+                        className="rounded-2xl p-4 space-y-2 bg-zinc-900/90 border border-white/10"
+                        style={{ color: "#fff" }}
+                      >
+                        <div className="text-[0.75rem] font-semibold">
+                          No active raffles yet
                         </div>
-                        <div className="flex justify-between text-[0.65rem] opacity-90">
-                          <span>
-                            {heroTicketsSold} / {heroTotalTickets} tickets
-                          </span>
-                          <span>{heroTicketPrice} / ticket</span>
+                        <div className="text-[0.65rem] text-zinc-400">
+                          Once raffles are live, this preview will show real
+                          progress and draw timing.
                         </div>
                       </div>
-                    </div>
+                    )}
 
                     {/* Two small tiles */}
                     <div className="grid grid-cols-2 gap-2 text-[0.65rem]">
@@ -318,16 +384,7 @@ export default async function Home() {
                           Next draw
                         </div>
                         <div className="font-semibold text-zinc-50">
-                          {heroRaffle?.draw_date
-                            ? new Date(heroRaffle.draw_date).toLocaleString(
-                                "en-IE",
-                                {
-                                  weekday: "short",
-                                  hour: "2-digit",
-                                  minute: "2-digit",
-                                }
-                              )
-                            : "Friday · 20:00"}
+                          {heroDrawText}
                         </div>
                         <div className="mt-0.5 text-zinc-400">
                           Notification when completed.
@@ -336,27 +393,25 @@ export default async function Home() {
 
                       <div className="rounded-xl p-2.5 bg-zinc-900/90 border border-white/8">
                         <div className="text-[0.6rem] uppercase tracking-wide text-zinc-500 mb-0.5">
-                          Your entries
+                          Active raffles
                         </div>
                         <div className="flex items-center justify-between">
                           <span className="font-semibold text-zinc-50">
-                            {heroRaffle ? "Live" : "3 tickets"}
+                            {activeCount}
                           </span>
                           <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[0.6rem]">
-                            High chance
+                            Live
                           </span>
                         </div>
                         <div className="mt-0.5 text-zinc-400">
-                          History in your profile.
+                          Public records updated regularly.
                         </div>
                       </div>
                     </div>
 
-                    {/* Bottom hint */}
                     <p className="mt-auto text-[0.6rem] text-center text-zinc-500">
-                      {hasLive
-                        ? "Snapshot of a live raffle. Actual data updates in real-time inside the app."
-                        : "Product preview only. Real raffles will run inside the SnapWin app."}
+                      Public data preview. Entries take place in the SnapWin
+                      app.
                     </p>
                   </div>
                 </div>
@@ -366,7 +421,6 @@ export default async function Home() {
 
           {/* RIGHT: hero copy & CTAs */}
           <div className="space-y-8">
-            {/* Badge */}
             <div
               className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-[0.68rem] sm:text-xs font-medium border backdrop-blur-md shadow-sm"
               style={{
@@ -379,7 +433,7 @@ export default async function Home() {
                 className="inline-block h-2 w-2 rounded-full animate-pulse"
                 style={{ backgroundColor: COLORS.success }}
               />
-              Private beta · Launching in Ireland first
+              Live public raffle records · Updated regularly
             </div>
 
             <div className="space-y-4">
@@ -399,7 +453,7 @@ export default async function Home() {
               >
                 SnapWin blends luxury product design with fair, auditable raffle
                 mechanics. Live ticket progress, a clean wallet for your entries
-                and secure payments – packaged in a native app that feels as
+                and secure payments — packaged in a native app that feels as
                 polished as the prizes you are playing for.
               </p>
             </div>
@@ -431,12 +485,12 @@ export default async function Home() {
               </button>
             </div>
 
-            {/* Premium stats row (still mostly static, can be made live later if you want) */}
+            {/* Live stats row */}
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-[0.75rem]">
               {[
-                { label: "Focus", value: "Ireland first" },
-                { label: "Draw engine", value: "Auditable" },
-                { label: "Payments", value: "Stripe secured" },
+                { label: "Active raffles", value: String(activeCount) },
+                { label: "Tickets sold", value: String(totalTicketsSoldAll) },
+                { label: "Completed draws", value: String(completedDraws) },
               ].map((item) => (
                 <div
                   key={item.label}
@@ -469,120 +523,159 @@ export default async function Home() {
           </div>
         </section>
 
-        {/* Live raffles preview strip – now driven by DB when available */}
+        {/* Live raffles preview strip */}
         <section className="space-y-4">
           <div className="flex items-center justify-between gap-3">
             <h2
               className="text-sm sm:text-base font-semibold tracking-wide uppercase"
               style={{ color: COLORS.textSecondary }}
             >
-              Sneak peek · {hasLive ? "Live raffles" : "Demo raffles"} inside
-              SnapWin
+              Live preview · Active raffle records
             </h2>
-            <span
-              className="hidden sm:inline-flex items-center gap-1 text-[0.7rem]"
+
+            <Link
+              href="/public-raffles"
+              className="hidden sm:inline-flex items-center gap-1 text-[0.75rem] underline"
               style={{ color: COLORS.textMuted }}
             >
-              Swipe on mobile · Scroll on desktop
-            </span>
+              View all
+            </Link>
           </div>
 
           <div className="overflow-x-auto -mx-2 px-2 pb-1">
             <div className="flex gap-4 min-w-max">
-              {previewRaffles.map((raffle) => {
-                const r = raffle as Raffle;
-                const total = r.total_tickets || 0;
-                const sold = r.sold_tickets || 0;
+              {activeRaffles.map((raffle) => {
+                const total = Math.max(raffle.total_tickets, 0);
+                const sold = Math.max(raffle.sold_tickets, 0);
                 const progress =
-                  total > 0 ? Math.round((sold / total) * 100) : 0;
-                const priceLabel =
-                  r.ticket_price != null
-                    ? `€${r.ticket_price.toFixed(2)}`
-                    : "€0.00";
-                const ticketsLabel =
-                  total > 0 ? `${sold} / ${total}` : `${sold} tickets`;
-
-                const isDemo = r.status === "demo";
+                  total > 0
+                    ? clamp(Math.round((sold / total) * 100), 0, 100)
+                    : 0;
 
                 return (
-                  <div
-                    key={r.id}
-                    className="w-64 rounded-2xl border backdrop-blur-sm p-4 flex flex-col justify-between transition-transform duration-200 hover:-translate-y-1 hover:shadow-xl"
-                    style={{
-                      backgroundColor: `${COLORS.cardBg}F5`,
-                      borderColor: COLORS.cardBorder,
-                      boxShadow: `0 10px 28px ${COLORS.cardShadow}`,
-                    }}
+                  <Link
+                    key={raffle.id}
+                    href={`/public-raffles/${raffle.id}`}
+                    className="block"
                   >
-                    <div className="space-y-2">
-                      <div className="flex items-center justify-between text-[0.7rem]">
-                        <span
-                          className="px-2 py-0.5 rounded-full"
-                          style={{
-                            backgroundColor: COLORS.raffleTicketBg,
-                            color: COLORS.raffleTicketText,
-                          }}
-                        >
-                          {isDemo ? "Demo" : "Live"}
-                        </span>
-                        <span style={{ color: COLORS.textMuted }}>
-                          {isDemo ? "Demo preview" : "Now filling"}
-                        </span>
-                      </div>
-                      <h3
-                        className="text-sm font-semibold"
-                        style={{ color: COLORS.textPrimary }}
-                      >
-                        {r.item_name}
-                      </h3>
-                      <p
-                        className="text-[0.7rem]"
-                        style={{ color: COLORS.textSecondary }}
-                      >
-                        Live ticket counts, clear caps and visible draw times
-                        before you enter.
-                      </p>
-                    </div>
+                    <div
+                      className="w-64 rounded-2xl border backdrop-blur-sm p-4 flex flex-col justify-between transition-transform duration-200 hover:-translate-y-1 hover:shadow-xl"
+                      style={{
+                        backgroundColor: `${COLORS.cardBg}F5`,
+                        borderColor: COLORS.cardBorder,
+                        boxShadow: `0 10px 28px ${COLORS.cardShadow}`,
+                      }}
+                    >
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between text-[0.7rem]">
+                          <span
+                            className="px-2 py-0.5 rounded-full"
+                            style={{
+                              backgroundColor: COLORS.raffleTicketBg,
+                              color: COLORS.raffleTicketText,
+                            }}
+                          >
+                            Active
+                          </span>
+                          <span style={{ color: COLORS.textMuted }}>
+                            Live record
+                          </span>
+                        </div>
 
-                    <div className="mt-3 space-y-1.5">
-                      <div className="flex items-center justify-between text-[0.7rem]">
-                        <span style={{ color: COLORS.textSecondary }}>
-                          Tickets sold
-                        </span>
-                        <span style={{ color: COLORS.textPrimary }}>
-                          {progress}% full
-                        </span>
+                        <h3
+                          className="text-sm font-semibold"
+                          style={{ color: COLORS.textPrimary }}
+                        >
+                          {raffle.item_name}
+                        </h3>
+
+                        <p
+                          className="text-[0.7rem]"
+                          style={{ color: COLORS.textSecondary }}
+                        >
+                          {raffle.item_description
+                            ? raffle.item_description.slice(0, 70) +
+                              (raffle.item_description.length > 70 ? "…" : "")
+                            : "Public raffle record with live progress and ticket caps."}
+                        </p>
                       </div>
-                      <div
-                        className="w-full h-2 rounded-full overflow-hidden"
-                        style={{ backgroundColor: COLORS.raffleRemaining }}
-                      >
+
+                      <div className="mt-3 space-y-1.5">
+                        <div className="flex items-center justify-between text-[0.7rem]">
+                          <span style={{ color: COLORS.textSecondary }}>
+                            Tickets sold
+                          </span>
+                          <span style={{ color: COLORS.textPrimary }}>
+                            {progress}% full
+                          </span>
+                        </div>
+
                         <div
-                          className="h-2 rounded-full"
-                          style={{
-                            width: `${progress}%`,
-                            backgroundColor: COLORS.raffleSoldProgress,
-                          }}
-                        />
-                      </div>
-                      <div className="flex items-center justify-between text-[0.7rem]">
-                        <span style={{ color: COLORS.textSecondary }}>
-                          {ticketsLabel}
-                        </span>
-                        <span style={{ color: COLORS.primary }}>
-                          {priceLabel} / ticket
-                        </span>
+                          className="w-full h-2 rounded-full overflow-hidden"
+                          style={{ backgroundColor: COLORS.raffleRemaining }}
+                        >
+                          <div
+                            className="h-2 rounded-full"
+                            style={{
+                              width: `${progress}%`,
+                              backgroundColor: COLORS.raffleSoldProgress,
+                            }}
+                          />
+                        </div>
+
+                        <div className="flex items-center justify-between text-[0.7rem]">
+                          <span style={{ color: COLORS.textSecondary }}>
+                            {sold} / {total}
+                          </span>
+                          <span style={{ color: COLORS.primary }}>
+                            {formatEuro(raffle.ticket_price)} / ticket
+                          </span>
+                        </div>
                       </div>
                     </div>
-                  </div>
+                  </Link>
                 );
               })}
+
+              {activeRaffles.length === 0 && (
+                <div
+                  className="w-72 rounded-2xl border p-4"
+                  style={{
+                    backgroundColor: `${COLORS.cardBg}F5`,
+                    borderColor: COLORS.cardBorder,
+                  }}
+                >
+                  <div
+                    className="text-sm font-semibold"
+                    style={{ color: COLORS.textPrimary }}
+                  >
+                    No active raffles yet
+                  </div>
+                  <div
+                    className="text-xs mt-1"
+                    style={{ color: COLORS.textSecondary }}
+                  >
+                    Once raffles are created and marked active, this section
+                    will automatically populate with live records.
+                  </div>
+                </div>
+              )}
             </div>
+          </div>
+
+          <div className="sm:hidden">
+            <Link
+              href="/public-raffles"
+              className="text-sm underline"
+              style={{ color: COLORS.textMuted }}
+            >
+              View all active raffles
+            </Link>
           </div>
         </section>
 
         {/* How it works */}
-        <section id="how-it-works" className="space-y-6 pt-2 scroll-mt-24">
+        <section id="how-it-works" className="space-y-6 pt-2">
           <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
             <div>
               <h2
@@ -664,7 +757,7 @@ export default async function Home() {
         {/* Features + compliance */}
         <section
           id="features"
-          className="grid grid-cols-1 lg:grid-cols-[1.1fr,0.9fr] gap-6 items-start scroll-mt-24"
+          className="grid grid-cols-1 lg:grid-cols-[1.1fr,0.9fr] gap-6 items-start"
         >
           <div className="space-y-4">
             <h2
@@ -678,7 +771,7 @@ export default async function Home() {
               style={{ color: COLORS.textSecondary }}
             >
               The same engine that powers your SnapWin admin dashboard also
-              drives the player experience – one source of truth for raffles,
+              drives the player experience — one source of truth for raffles,
               tickets, payments and draws.
             </p>
 
@@ -698,7 +791,7 @@ export default async function Home() {
                 },
                 {
                   title: "Smart notifications",
-                  body: "Push notifications for entries, results, support and more – all driven from your admin tools.",
+                  body: "Push notifications for entries, results, support and more — all driven from your admin tools.",
                 },
               ].map((f) => (
                 <div
@@ -772,7 +865,7 @@ export default async function Home() {
         </section>
 
         {/* FAQ */}
-        <section id="faq" className="space-y-5 pb-8 scroll-mt-24">
+        <section id="faq" className="space-y-5 pb-8">
           <h2
             className="text-2xl font-bold tracking-tight"
             style={{ color: COLORS.primary }}
