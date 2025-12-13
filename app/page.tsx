@@ -2,8 +2,98 @@
 import Image from "next/image";
 import Link from "next/link";
 import { COLORS } from "@/lib/colors";
+import { createClient } from "@supabase/supabase-js";
 
-export default function Home() {
+export const revalidate = 30; // seconds – landing auto-refreshes every ~30s
+
+type Raffle = {
+  id: string;
+  item_name: string;
+  ticket_price: number;
+  total_tickets: number;
+  sold_tickets: number;
+  status: string;
+  draw_date: string | null;
+};
+
+export default async function Home() {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+  let raffles: Raffle[] | null = null;
+
+  if (supabaseUrl && supabaseAnonKey) {
+    const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+    const { data, error } = await supabase
+      .from("raffles")
+      .select(
+        "id, item_name, ticket_price, total_tickets, sold_tickets, status, draw_date"
+      )
+      .eq("status", "active")
+      .order("created_at", { ascending: false })
+      .limit(3);
+
+    if (!error && data) {
+      raffles = data;
+    }
+  }
+
+  const heroRaffle = raffles?.[0] ?? null;
+
+  const heroTicketsSold =
+    heroRaffle?.sold_tickets != null ? heroRaffle.sold_tickets : 381;
+  const heroTotalTickets =
+    heroRaffle?.total_tickets != null && heroRaffle.total_tickets > 0
+      ? heroRaffle.total_tickets
+      : 500;
+
+  const heroProgress =
+    heroRaffle && heroTotalTickets > 0
+      ? Math.round((heroTicketsSold / heroTotalTickets) * 100)
+      : 76;
+
+  const heroTicketPrice =
+    heroRaffle?.ticket_price != null
+      ? `€${heroRaffle.ticket_price.toFixed(2)}`
+      : "€4.99";
+
+  const heroTitle = heroRaffle?.item_name ?? "Flagship smartphone";
+
+  const hasLive = raffles && raffles.length > 0;
+
+  const previewRaffles: Raffle[] | { id: string }[] = hasLive
+    ? raffles!
+    : [
+        {
+          id: "demo-1",
+          item_name: "Flagship smartphone",
+          ticket_price: 4.99,
+          total_tickets: 500,
+          sold_tickets: 361,
+          status: "demo",
+          draw_date: null,
+        },
+        {
+          id: "demo-2",
+          item_name: "Next-gen console",
+          ticket_price: 3.49,
+          total_tickets: 500,
+          sold_tickets: 240,
+          status: "demo",
+          draw_date: null,
+        },
+        {
+          id: "demo-3",
+          item_name: "Luxury watch",
+          ticket_price: 5.99,
+          total_tickets: 500,
+          sold_tickets: 150,
+          status: "demo",
+          draw_date: null,
+        },
+      ];
+
   return (
     <main
       className="min-h-screen relative overflow-hidden"
@@ -36,7 +126,7 @@ export default function Home() {
       />
 
       <div className="relative max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-10 space-y-16">
-        {/* Top nav (normal, not sticky) */}
+        {/* Top nav (normal, not sticky – just like you liked it) */}
         <header className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <div className="relative h-9 w-9 sm:h-10 sm:w-10 rounded-2xl overflow-hidden border border-white/60 shadow-md shadow-black/10 bg-white/70 backdrop-blur">
@@ -100,9 +190,9 @@ export default function Home() {
           </nav>
         </header>
 
-        {/* HERO – premium, clearly re-designed */}
+        {/* HERO – premium, with live hero raffle */}
         <section className="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-12 lg:gap-16 items-center">
-          {/* LEFT: realistic iPhone mockup (scaled up to balance hero) */}
+          {/* LEFT: realistic iPhone mockup (balanced size) */}
           <div className="flex justify-center lg:justify-start">
             <div className="relative w-full max-w-[13rem] sm:max-w-[15rem] lg:max-w-[16rem]">
               {/* Soft glow plate */}
@@ -176,7 +266,7 @@ export default function Home() {
 
                       <div className="flex items-center justify-between text-[0.7rem] opacity-95">
                         <span>Featured raffle</span>
-                        <span>Flagship smartphone</span>
+                        <span>{heroTitle}</span>
                       </div>
 
                       <div className="flex items-center gap-3">
@@ -190,7 +280,7 @@ export default function Home() {
                         </div>
                         <div className="space-y-0.5">
                           <p className="text-sm font-semibold leading-tight">
-                            Win the latest device
+                            {heroTitle}
                           </p>
                           <p className="text-[0.7rem] opacity-90">
                             Limited entries · Verified draw
@@ -201,20 +291,22 @@ export default function Home() {
                       <div className="space-y-1.5">
                         <div className="flex items-center justify-between text-[0.7rem] opacity-90">
                           <span>Tickets sold</span>
-                          <span>76% filled</span>
+                          <span>{heroProgress}% filled</span>
                         </div>
                         <div className="w-full h-1.5 rounded-full bg-white/15 overflow-hidden">
                           <div
                             className="h-1.5 rounded-full"
                             style={{
-                              width: "76%",
+                              width: `${heroProgress}%`,
                               backgroundColor: COLORS.raffleSoldProgress,
                             }}
                           />
                         </div>
                         <div className="flex justify-between text-[0.65rem] opacity-90">
-                          <span>381 / 500 tickets</span>
-                          <span>€4.99 / ticket</span>
+                          <span>
+                            {heroTicketsSold} / {heroTotalTickets} tickets
+                          </span>
+                          <span>{heroTicketPrice} / ticket</span>
                         </div>
                       </div>
                     </div>
@@ -226,7 +318,16 @@ export default function Home() {
                           Next draw
                         </div>
                         <div className="font-semibold text-zinc-50">
-                          Friday · 20:00
+                          {heroRaffle?.draw_date
+                            ? new Date(heroRaffle.draw_date).toLocaleString(
+                                "en-IE",
+                                {
+                                  weekday: "short",
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                }
+                              )
+                            : "Friday · 20:00"}
                         </div>
                         <div className="mt-0.5 text-zinc-400">
                           Notification when completed.
@@ -239,7 +340,7 @@ export default function Home() {
                         </div>
                         <div className="flex items-center justify-between">
                           <span className="font-semibold text-zinc-50">
-                            3 tickets
+                            {heroRaffle ? "Live" : "3 tickets"}
                           </span>
                           <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[0.6rem]">
                             High chance
@@ -253,8 +354,9 @@ export default function Home() {
 
                     {/* Bottom hint */}
                     <p className="mt-auto text-[0.6rem] text-center text-zinc-500">
-                      Product preview only. Real raffles will run inside the
-                      SnapWin app.
+                      {hasLive
+                        ? "Snapshot of a live raffle. Actual data updates in real-time inside the app."
+                        : "Product preview only. Real raffles will run inside the SnapWin app."}
                     </p>
                   </div>
                 </div>
@@ -329,7 +431,7 @@ export default function Home() {
               </button>
             </div>
 
-            {/* Premium stats row */}
+            {/* Premium stats row (still mostly static, can be made live later if you want) */}
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-[0.75rem]">
               {[
                 { label: "Focus", value: "Ireland first" },
@@ -367,14 +469,15 @@ export default function Home() {
           </div>
         </section>
 
-        {/* Live raffles preview strip – simplified, premium */}
+        {/* Live raffles preview strip – now driven by DB when available */}
         <section className="space-y-4">
           <div className="flex items-center justify-between gap-3">
             <h2
               className="text-sm sm:text-base font-semibold tracking-wide uppercase"
               style={{ color: COLORS.textSecondary }}
             >
-              Sneak peek · Raffles the way they will appear in SnapWin
+              Sneak peek · {hasLive ? "Live raffles" : "Demo raffles"} inside
+              SnapWin
             </h2>
             <span
               className="hidden sm:inline-flex items-center gap-1 text-[0.7rem]"
@@ -386,100 +489,94 @@ export default function Home() {
 
           <div className="overflow-x-auto -mx-2 px-2 pb-1">
             <div className="flex gap-4 min-w-max">
-              {[
-                {
-                  title: "Flagship smartphone",
-                  tag: "Tech",
-                  progress: 72,
-                  price: "€4.99",
-                  tickets: "361 / 500",
-                },
-                {
-                  title: "Next-gen console",
-                  tag: "Gaming",
-                  progress: 48,
-                  price: "€3.49",
-                  tickets: "240 / 500",
-                },
-                {
-                  title: "Luxury watch",
-                  tag: "Premium",
-                  progress: 30,
-                  price: "€5.99",
-                  tickets: "150 / 500",
-                },
-              ].map((raffle) => (
-                <div
-                  key={raffle.title}
-                  className="w-64 rounded-2xl border backdrop-blur-sm p-4 flex flex-col justify-between transition-transform duration-200 hover:-translate-y-1 hover:shadow-xl"
-                  style={{
-                    backgroundColor: `${COLORS.cardBg}F5`,
-                    borderColor: COLORS.cardBorder,
-                    boxShadow: `0 10px 28px ${COLORS.cardShadow}`,
-                  }}
-                >
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between text-[0.7rem]">
-                      <span
-                        className="px-2 py-0.5 rounded-full"
-                        style={{
-                          backgroundColor: COLORS.raffleTicketBg,
-                          color: COLORS.raffleTicketText,
-                        }}
-                      >
-                        {raffle.tag}
-                      </span>
-                      <span style={{ color: COLORS.textMuted }}>
-                        Demo preview
-                      </span>
-                    </div>
-                    <h3
-                      className="text-sm font-semibold"
-                      style={{ color: COLORS.textPrimary }}
-                    >
-                      {raffle.title}
-                    </h3>
-                    <p
-                      className="text-[0.7rem]"
-                      style={{ color: COLORS.textSecondary }}
-                    >
-                      Live ticket counts, clear caps and visible draw times
-                      before you enter.
-                    </p>
-                  </div>
+              {previewRaffles.map((raffle) => {
+                const r = raffle as Raffle;
+                const total = r.total_tickets || 0;
+                const sold = r.sold_tickets || 0;
+                const progress =
+                  total > 0 ? Math.round((sold / total) * 100) : 0;
+                const priceLabel =
+                  r.ticket_price != null
+                    ? `€${r.ticket_price.toFixed(2)}`
+                    : "€0.00";
+                const ticketsLabel =
+                  total > 0 ? `${sold} / ${total}` : `${sold} tickets`;
 
-                  <div className="mt-3 space-y-1.5">
-                    <div className="flex items-center justify-between text-[0.7rem]">
-                      <span style={{ color: COLORS.textSecondary }}>
-                        Tickets sold
-                      </span>
-                      <span style={{ color: COLORS.textPrimary }}>
-                        {raffle.progress}% full
-                      </span>
+                const isDemo = r.status === "demo";
+
+                return (
+                  <div
+                    key={r.id}
+                    className="w-64 rounded-2xl border backdrop-blur-sm p-4 flex flex-col justify-between transition-transform duration-200 hover:-translate-y-1 hover:shadow-xl"
+                    style={{
+                      backgroundColor: `${COLORS.cardBg}F5`,
+                      borderColor: COLORS.cardBorder,
+                      boxShadow: `0 10px 28px ${COLORS.cardShadow}`,
+                    }}
+                  >
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between text-[0.7rem]">
+                        <span
+                          className="px-2 py-0.5 rounded-full"
+                          style={{
+                            backgroundColor: COLORS.raffleTicketBg,
+                            color: COLORS.raffleTicketText,
+                          }}
+                        >
+                          {isDemo ? "Demo" : "Live"}
+                        </span>
+                        <span style={{ color: COLORS.textMuted }}>
+                          {isDemo ? "Demo preview" : "Now filling"}
+                        </span>
+                      </div>
+                      <h3
+                        className="text-sm font-semibold"
+                        style={{ color: COLORS.textPrimary }}
+                      >
+                        {r.item_name}
+                      </h3>
+                      <p
+                        className="text-[0.7rem]"
+                        style={{ color: COLORS.textSecondary }}
+                      >
+                        Live ticket counts, clear caps and visible draw times
+                        before you enter.
+                      </p>
                     </div>
-                    <div
-                      className="w-full h-2 rounded-full overflow-hidden"
-                      style={{ backgroundColor: COLORS.raffleRemaining }}
-                    >
+
+                    <div className="mt-3 space-y-1.5">
+                      <div className="flex items-center justify-between text-[0.7rem]">
+                        <span style={{ color: COLORS.textSecondary }}>
+                          Tickets sold
+                        </span>
+                        <span style={{ color: COLORS.textPrimary }}>
+                          {progress}% full
+                        </span>
+                      </div>
                       <div
-                        className="h-2 rounded-full"
-                        style={{
-                          width: `${raffle.progress}%`,
-                          backgroundColor: COLORS.raffleSoldProgress,
-                        }}
-                      />
-                    </div>
-                    <div className="flex items-center justify-between text-[0.7rem]">
-                      <span style={{ color: COLORS.textSecondary }}>
-                        {raffle.tickets}
-                      </span>
-                      <span style={{ color: COLORS.primary }}>
-                        {raffle.price} / ticket
-                      </span>
+                        className="w-full h-2 rounded-full overflow-hidden"
+                        style={{ backgroundColor: COLORS.raffleRemaining }}
+                      >
+                        <div
+                          className="h-2 rounded-full"
+                          style={{
+                            width: `${progress}%`,
+                            backgroundColor: COLORS.raffleSoldProgress,
+                          }}
+                        />
+                      </div>
+                      <div className="flex items-center justify-between text-[0.7rem]">
+                        <span style={{ color: COLORS.textSecondary }}>
+                          {ticketsLabel}
+                        </span>
+                        <span style={{ color: COLORS.primary }}>
+                          {priceLabel} / ticket
+                        </span>
+                      </div>
                     </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </section>
@@ -737,27 +834,27 @@ export default function Home() {
               © {new Date().getFullYear()} SnapWin. All rights reserved.
             </span>
             <div className="flex flex-wrap gap-4">
-              <a
-                href="#"
+              <Link
+                href="/terms"
                 className="hover:underline"
                 style={{ color: COLORS.textSecondary }}
               >
                 Terms &amp; Conditions
-              </a>
-              <a
-                href="#"
+              </Link>
+              <Link
+                href="/privacy"
                 className="hover:underline"
                 style={{ color: COLORS.textSecondary }}
               >
                 Privacy Policy
-              </a>
-              <a
-                href="#"
+              </Link>
+              <Link
+                href="/responsible-play"
                 className="hover:underline"
                 style={{ color: COLORS.textSecondary }}
               >
                 Responsible Play
-              </a>
+              </Link>
               <Link
                 href="/login"
                 className="hover:underline"
