@@ -81,6 +81,13 @@ export default function RaffleDetailPage() {
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const [imageSaving, setImageSaving] = useState(false);
 
+  // Prevent object URL memory leaks
+  useEffect(() => {
+    return () => {
+      if (imagePreview) URL.revokeObjectURL(imagePreview);
+    };
+  }, [imagePreview]);
+
   useEffect(() => {
     const fetchDetail = async () => {
       try {
@@ -299,6 +306,10 @@ export default function RaffleDetailPage() {
   // image file selection
   const handleImageChange = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null;
+
+    // Revoke old preview before creating a new one
+    if (imagePreview) URL.revokeObjectURL(imagePreview);
+
     setImageFile(file);
 
     if (file) {
@@ -456,6 +467,8 @@ export default function RaffleDetailPage() {
 
   if (!raffle) return null;
 
+  const currentImageSrc = raffle.item_image_url || "/vercel.svg";
+
   return (
     <div className="space-y-6">
       {/* Top header */}
@@ -581,21 +594,25 @@ export default function RaffleDetailPage() {
               Raffle image
             </div>
 
-            {raffle.item_image_url ? (
-              <div className="relative w-full h-40 rounded border overflow-hidden mb-2">
+            <div
+              className="rounded border overflow-hidden"
+              style={{
+                borderColor: COLORS.cardBorder,
+                backgroundColor: COLORS.highlightCardBg,
+              }}
+            >
+              {/* Fixed frame; always contained (no crop, no overflow) */}
+              <div className="relative w-full h-40">
                 <Image
-                  src={raffle.item_image_url}
+                  src={currentImageSrc}
                   alt={raffle.item_name}
                   fill
-                  sizes="(max-width: 768px) 200px, 300px"
-                  className="object-cover"
+                  sizes="(max-width: 1024px) 100vw, 320px"
+                  className="object-contain"
+                  priority
                 />
               </div>
-            ) : (
-              <p className="text-xs" style={{ color: COLORS.textMuted }}>
-                No image set for this raffle yet.
-              </p>
-            )}
+            </div>
 
             {imagePreview && (
               <div className="space-y-2">
@@ -603,22 +620,24 @@ export default function RaffleDetailPage() {
                   className="text-xs font-medium"
                   style={{ color: COLORS.textSecondary }}
                 >
-                  Preview
+                  New image preview
                 </div>
 
                 <div
-                  className="border rounded-lg overflow-hidden max-w-xs"
+                  className="border rounded-lg overflow-hidden"
                   style={{
                     borderColor: COLORS.cardBorder,
                     backgroundColor: COLORS.highlightCardBg,
                   }}
                 >
-                  <div className="w-full h-40 flex items-center justify-center">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
+                  <div className="relative w-full h-40">
+                    <Image
                       src={imagePreview}
                       alt="Raffle preview"
-                      className="max-w-full max-h-full object-contain"
+                      fill
+                      className="object-contain"
+                      sizes="320px"
+                      priority
                     />
                   </div>
                 </div>
