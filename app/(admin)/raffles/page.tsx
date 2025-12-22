@@ -1,6 +1,7 @@
 // app/(admin)/raffles/page.tsx
 "use client";
 
+import Image from "next/image";
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
@@ -9,6 +10,7 @@ import { COLORS } from "@/lib/colors";
 type RaffleRow = {
   id: string;
   item_name: string;
+  item_image_url?: string | null;
   status: "active" | "soldout" | "drawn" | "cancelled";
   total_tickets: number;
   sold_tickets: number | null;
@@ -34,7 +36,7 @@ export default function RafflesPage() {
         const { data, error } = await supabase
           .from("raffles")
           .select(
-            "id, item_name, status, total_tickets, sold_tickets, ticket_price, draw_date, created_at"
+            "id, item_name, item_image_url, status, total_tickets, sold_tickets, ticket_price, draw_date, created_at"
           )
           .order("created_at", { ascending: false });
 
@@ -278,6 +280,8 @@ function RaffleRowItem({
       ? raffle.ticket_price
       : parseFloat(raffle.ticket_price as string);
 
+  const thumbSrc = raffle.item_image_url || "/vercel.svg";
+
   return (
     <tr
       className="border-t transition-colors hover:bg-gray-50"
@@ -288,19 +292,44 @@ function RaffleRowItem({
     >
       {/* Item */}
       <td className="px-4 py-3 align-top">
-        <Link href={`/raffles/${raffle.id}`}>
-          <div>
+        <Link href={`/raffles/${raffle.id}`} className="block">
+          <div className="flex items-start gap-3">
+            {/* Thumbnail frame (no crop, no overflow) */}
             <div
-              className="font-medium hover:underline"
-              style={{ color: COLORS.textPrimary }}
+              className="flex-shrink-0 rounded-lg border overflow-hidden"
+              style={{
+                width: 56,
+                height: 56,
+                borderColor: COLORS.cardBorder,
+                backgroundColor: COLORS.highlightCardBg,
+              }}
             >
-              {raffle.item_name}
+              <div className="relative w-full h-full">
+                <Image
+                  src={thumbSrc}
+                  alt={raffle.item_name}
+                  fill
+                  className="object-contain"
+                  sizes="56px"
+                />
+              </div>
             </div>
-            <div
-              className="text-[0.7rem] mt-1"
-              style={{ color: COLORS.textSecondary }}
-            >
-              ID: {raffle.id}
+
+            <div className="min-w-0">
+              <div
+                className="font-medium hover:underline truncate"
+                style={{ color: COLORS.textPrimary }}
+                title={raffle.item_name}
+              >
+                {raffle.item_name}
+              </div>
+              <div
+                className="text-[0.7rem] mt-1 truncate"
+                style={{ color: COLORS.textSecondary }}
+                title={raffle.id}
+              >
+                ID: {raffle.id}
+              </div>
             </div>
           </div>
         </Link>
