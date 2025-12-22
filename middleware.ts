@@ -5,7 +5,6 @@ import { NextResponse } from "next/server";
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
-  // Routes to protect
   const adminRoutes = [
     "/dashboard",
     "/raffles",
@@ -19,21 +18,13 @@ export function middleware(req: NextRequest) {
     (base) => pathname === base || pathname.startsWith(`${base}/`)
   );
 
-  if (!isAdminRoute) {
-    return NextResponse.next();
-  }
+  if (!isAdminRoute) return NextResponse.next();
 
-  const adminCookie = req.cookies.get("snapwin-admin");
-
-  if (!adminCookie) {
-    const loginUrl = new URL("/login", req.url);
-    return NextResponse.redirect(loginUrl);
-  }
-
+  // UX cookie only — do not hard-block production navigation based on this cookie alone.
+  // Client-side AdminLayout will verify Supabase auth + admin_users membership.
   return NextResponse.next();
 }
 
-// Tell Next.js which routes to run middleware on
 export const config = {
   matcher: [
     "/dashboard/:path*",

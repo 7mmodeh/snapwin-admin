@@ -2,55 +2,91 @@
 "use client";
 
 import { ReactNode, useEffect, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
 
-type AdminUser = {
-  id: string;
-};
+type AdminUser = { id: string };
+
+function isHttps() {
+  return typeof window !== "undefined" && window.location.protocol === "https:";
+}
+
+function setAdminCookie() {
+  document.cookie =
+    `snapwin-admin=1; Path=/; Max-Age=604800; SameSite=Lax` +
+    (isHttps() ? "; Secure" : "");
+}
+
+function clearAdminCookie() {
+  document.cookie =
+    `snapwin-admin=; Path=/; Max-Age=0; SameSite=Lax` +
+    (isHttps() ? "; Secure" : "");
+}
 
 export default function AdminLayout({ children }: { children: ReactNode }) {
   const router = useRouter();
   const [checking, setChecking] = useState(true);
 
   useEffect(() => {
-    const checkAuth = async () => {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
+    let cancelled = false;
 
-      if (!user || !user.email) {
-        document.cookie = "snapwin-admin=; Path=/; Max-Age=0;";
-        router.replace("/login");
-        return;
-      }
-
-      const { data: adminRecord, error: adminError } = await supabase
-        .from("admin_users")
-        .select("id")
-        .eq("email", user.email)
-        .maybeSingle<AdminUser>();
-
-      if (adminError || !adminRecord) {
-        console.error("Admin check failed:", adminError);
+    const failToLogin = async () => {
+      try {
         await supabase.auth.signOut();
-        document.cookie = "snapwin-admin=; Path=/; Max-Age=0;";
-        router.replace("/login");
-        return;
-      }
+      } catch {}
+      clearAdminCookie();
+      if (!cancelled) router.replace("/login");
+    };
 
-      // User is admin → ensure cookie for middleware
-      document.cookie = "snapwin-admin=1; Path=/; Max-Age=604800; SameSite=Lax";
-      setChecking(false);
+    const checkAuth = async () => {
+      try {
+        const res = await supabase.auth.getUser();
+        const user = res?.data?.user;
+
+        if (!user?.email) {
+          await failToLogin();
+          return;
+        }
+
+        const { data: adminRecord, error: adminError } = await supabase
+          .from("admin_users")
+          .select("id")
+          .eq("email", user.email)
+          .maybeSingle<AdminUser>();
+
+        if (adminError || !adminRecord) {
+          await failToLogin();
+          return;
+        }
+
+        setAdminCookie();
+        if (!cancelled) setChecking(false);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        // Your production error: "Invalid Refresh Token: Refresh Token Not Found"
+        if (msg.toLowerCase().includes("refresh token")) {
+          await failToLogin();
+          return;
+        }
+
+        console.error("Admin auth check error:", err);
+        await failToLogin();
+      }
     };
 
     checkAuth();
+
+    return () => {
+      cancelled = true;
+    };
   }, [router]);
 
   const handleLogout = async () => {
     await supabase.auth.signOut();
-    document.cookie = "snapwin-admin=; Path=/; Max-Age=0;";
+    clearAdminCookie();
     router.push("/login");
   };
 
@@ -69,7 +105,6 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
 
   return (
     <div className="flex h-screen" style={{ backgroundColor: COLORS.screenBg }}>
-      {/* Sidebar */}
       <aside
         className="w-64 border-r p-4 flex flex-col"
         style={{
@@ -85,48 +120,48 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
         </h2>
 
         <nav className="flex flex-col space-y-3 flex-1">
-          <a
+          <Link
             href="/dashboard"
             className="hover:underline"
             style={{ color: COLORS.textPrimary }}
           >
             Dashboard
-          </a>
-          <a
+          </Link>
+          <Link
             href="/raffles"
             className="hover:underline"
             style={{ color: COLORS.textPrimary }}
           >
             Raffles
-          </a>
-          <a
+          </Link>
+          <Link
             href="/customers"
             className="hover:underline"
             style={{ color: COLORS.textPrimary }}
           >
             Customers
-          </a>
-          <a
+          </Link>
+          <Link
             href="/payments"
             className="hover:underline"
             style={{ color: COLORS.textPrimary }}
           >
             Payments
-          </a>
-          <a
+          </Link>
+          <Link
             href="/support"
             className="hover:underline"
             style={{ color: COLORS.textPrimary }}
           >
             Support
-          </a>
-          <a
+          </Link>
+          <Link
             href="/notifications"
             className="hover:underline"
             style={{ color: COLORS.textPrimary }}
           >
             Notifications
-          </a>
+          </Link>
         </nav>
 
         <button
@@ -142,7 +177,6 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
         </button>
       </aside>
 
-      {/* Main content */}
       <main className="flex-1 p-6 overflow-y-auto">{children}</main>
     </div>
   );
