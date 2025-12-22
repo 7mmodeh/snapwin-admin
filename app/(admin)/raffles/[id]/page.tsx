@@ -598,22 +598,29 @@ export default function RaffleDetailPage() {
             )}
 
             {imagePreview && (
-              <div className="mt-1">
-                <span
-                  className="text-xs mb-1 block"
+              <div className="space-y-2">
+                <div
+                  className="text-xs font-medium"
                   style={{ color: COLORS.textSecondary }}
                 >
-                  New image preview:
-                </span>
-                <div className="relative w-full h-32 rounded border overflow-hidden">
-                  <Image
-                    src={imagePreview}
-                    alt="New raffle image preview"
-                    fill
-                    sizes="(max-width: 768px) 200px, 300px"
-                    className="object-cover"
-                    unoptimized
-                  />
+                  Preview
+                </div>
+
+                <div
+                  className="border rounded-lg overflow-hidden max-w-xs"
+                  style={{
+                    borderColor: COLORS.cardBorder,
+                    backgroundColor: COLORS.highlightCardBg,
+                  }}
+                >
+                  <div className="w-full h-40 flex items-center justify-center">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={imagePreview}
+                      alt="Raffle preview"
+                      className="max-w-full max-h-full object-contain"
+                    />
+                  </div>
                 </div>
               </div>
             )}

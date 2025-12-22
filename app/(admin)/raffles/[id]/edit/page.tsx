@@ -1,6 +1,6 @@
-// app/(admin)/raffles/[id]/edit/page.tsx
 "use client";
 
+import Image from "next/image";
 import { useEffect, useState, FormEvent, ChangeEvent } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
@@ -43,6 +43,13 @@ export default function EditRafflePage() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Prevent object URL memory leaks
+  useEffect(() => {
+    return () => {
+      if (imagePreview) URL.revokeObjectURL(imagePreview);
+    };
+  }, [imagePreview]);
+
   useEffect(() => {
     const fetchRaffle = async () => {
       if (!raffleId) return;
@@ -83,6 +90,7 @@ export default function EditRafflePage() {
         );
         setCurrentImageUrl(data.item_image_url);
         setImagePreview(null);
+        setImageFile(null);
       } catch (err: unknown) {
         console.error("Error loading raffle:", err);
         if (err instanceof Error) {
@@ -100,6 +108,10 @@ export default function EditRafflePage() {
 
   const handleImageChange = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null;
+
+    // Revoke old preview before creating a new one
+    if (imagePreview) URL.revokeObjectURL(imagePreview);
+
     setImageFile(file);
 
     if (file) {
@@ -219,6 +231,8 @@ export default function EditRafflePage() {
         setError("Failed to update raffle.");
       }
       setSaving(false);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -259,6 +273,8 @@ export default function EditRafflePage() {
   }
 
   if (!raffle) return null;
+
+  const previewSrc = imagePreview || currentImageUrl || "/vercel.svg";
 
   return (
     <div className="space-y-6">
@@ -460,13 +476,25 @@ export default function EditRafflePage() {
               >
                 Current / new preview
               </div>
-              <div className="border rounded-lg overflow-hidden max-w-xs">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={imagePreview || currentImageUrl || "/vercel.svg"}
-                  alt="Raffle preview"
-                  className="w-full h-40 object-cover"
-                />
+
+              <div
+                className="border rounded-lg overflow-hidden max-w-xs"
+                style={{
+                  borderColor: COLORS.cardBorder,
+                  backgroundColor: COLORS.highlightCardBg,
+                }}
+              >
+                {/* Fixed frame, image always contained (no crop, no overflow) */}
+                <div className="relative w-full h-40">
+                  <Image
+                    src={previewSrc}
+                    alt="Raffle preview"
+                    fill
+                    className="object-contain"
+                    sizes="320px"
+                    priority
+                  />
+                </div>
               </div>
             </div>
           </div>

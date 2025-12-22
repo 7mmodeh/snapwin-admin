@@ -1,6 +1,7 @@
 "use client";
 
-import { FormEvent, useState, ChangeEvent } from "react";
+import Image from "next/image";
+import { FormEvent, useEffect, useState, ChangeEvent } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
@@ -22,8 +23,19 @@ export default function CreateRafflePage() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Prevent object URL memory leaks
+  useEffect(() => {
+    return () => {
+      if (imagePreview) URL.revokeObjectURL(imagePreview);
+    };
+  }, [imagePreview]);
+
   const handleImageChange = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null;
+
+    // Revoke old preview before creating a new one
+    if (imagePreview) URL.revokeObjectURL(imagePreview);
+
     setImageFile(file);
 
     if (file) {
@@ -351,13 +363,25 @@ export default function CreateRafflePage() {
                 >
                   Preview
                 </div>
-                <div className="border rounded-lg overflow-hidden max-w-xs">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src={imagePreview}
-                    alt="Raffle preview"
-                    className="w-full h-40 object-cover"
-                  />
+
+                <div
+                  className="border rounded-lg overflow-hidden max-w-xs"
+                  style={{
+                    borderColor: COLORS.cardBorder,
+                    backgroundColor: COLORS.highlightCardBg,
+                  }}
+                >
+                  {/* Fixed frame, image always contained (no crop, no overflow) */}
+                  <div className="relative w-full h-40">
+                    <Image
+                      src={imagePreview}
+                      alt="Raffle preview"
+                      fill
+                      className="object-contain"
+                      sizes="320px"
+                      priority
+                    />
+                  </div>
                 </div>
               </div>
             )}
