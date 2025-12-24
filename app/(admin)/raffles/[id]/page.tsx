@@ -23,6 +23,7 @@ type RaffleDetail = {
   item_image_url: string | null;
   created_at: string;
   updated_at: string | null;
+  max_tickets_per_customer: number; // ✅ NEW
 };
 
 type TicketRow = {
@@ -75,6 +76,8 @@ export default function RaffleDetailPage() {
   const [statusDraft, setStatusDraft] =
     useState<RaffleDetail["status"]>("active");
   const [drawDateDraft, setDrawDateDraft] = useState<string>("");
+  const [maxTicketsPerCustomerDraft, setMaxTicketsPerCustomerDraft] =
+    useState<string>("3"); // ✅ NEW
 
   // Image replace state
   const [imageFile, setImageFile] = useState<File | null>(null);
@@ -100,7 +103,7 @@ export default function RaffleDetailPage() {
           supabase
             .from("raffles")
             .select(
-              "id, item_name, item_description, status, total_tickets, sold_tickets, ticket_price, draw_date, winner_id, item_image_url, created_at, updated_at"
+              "id, item_name, item_description, status, total_tickets, sold_tickets, ticket_price, draw_date, winner_id, item_image_url, created_at, updated_at, max_tickets_per_customer"
             )
             .eq("id", raffleId)
             .maybeSingle<RaffleDetail>(),
@@ -143,6 +146,11 @@ export default function RaffleDetailPage() {
           raffleData.draw_date ? toDateTimeLocalValue(raffleData.draw_date) : ""
         );
 
+        // ✅ NEW
+        setMaxTicketsPerCustomerDraft(
+          String(raffleData.max_tickets_per_customer ?? 3)
+        );
+
         // load winner details if any
         if (raffleData.winner_id) {
           const winnerRes = await supabase
@@ -154,6 +162,8 @@ export default function RaffleDetailPage() {
           if (!winnerRes.error && winnerRes.data) {
             setWinner(winnerRes.data);
           }
+        } else {
+          setWinner(null);
         }
       } catch (err: unknown) {
         console.error("Error loading raffle detail:", err);
@@ -218,6 +228,10 @@ export default function RaffleDetailPage() {
       ? parseInt(totalTicketsDraft, 10)
       : NaN;
 
+    const maxPerCustomerNumber = maxTicketsPerCustomerDraft
+      ? parseInt(maxTicketsPerCustomerDraft, 10)
+      : NaN;
+
     if (!Number.isNaN(priceNumber) && priceNumber <= 0) {
       setError("Ticket price must be a positive number.");
       return;
@@ -225,6 +239,17 @@ export default function RaffleDetailPage() {
 
     if (!Number.isNaN(totalTicketsNumber) && totalTicketsNumber <= 0) {
       setError("Total tickets must be a positive integer.");
+      return;
+    }
+
+    if (
+      Number.isNaN(maxPerCustomerNumber) ||
+      maxPerCustomerNumber < 1 ||
+      maxPerCustomerNumber > 1000
+    ) {
+      setError(
+        "Max tickets per customer must be an integer between 1 and 1000."
+      );
       return;
     }
 
@@ -249,9 +274,11 @@ export default function RaffleDetailPage() {
         total_tickets?: number;
         status: RaffleDetail["status"];
         draw_date: string | null;
+        max_tickets_per_customer: number; // ✅ NEW (required in payload)
       } = {
         status: statusDraft,
         draw_date: drawDateDraft ? new Date(drawDateDraft).toISOString() : null,
+        max_tickets_per_customer: maxPerCustomerNumber,
       };
 
       if (itemNameDraft.trim()) {
@@ -285,6 +312,7 @@ export default function RaffleDetailPage() {
               total_tickets: updatePayload.total_tickets ?? prev.total_tickets,
               status: updatePayload.status,
               draw_date: updatePayload.draw_date,
+              max_tickets_per_customer: updatePayload.max_tickets_per_customer,
               updated_at: new Date().toISOString(),
             }
           : prev
@@ -491,6 +519,14 @@ export default function RaffleDetailPage() {
           <p style={{ color: COLORS.textSecondary }}>
             {raffle.item_description}
           </p>
+
+          {/* ✅ NEW: Show max per customer in header area */}
+          <p className="text-xs mt-2" style={{ color: COLORS.textMuted }}>
+            Max tickets per customer:{" "}
+            <span style={{ color: COLORS.textSecondary, fontWeight: 700 }}>
+              {raffle.max_tickets_per_customer ?? 3}
+            </span>
+          </p>
         </div>
 
         <div className="flex flex-col items-start md:items-end gap-2">
@@ -566,6 +602,13 @@ export default function RaffleDetailPage() {
             label="Failed payments"
             value={stats.failedPayments.toString()}
             sub="Payment failed or cancelled"
+          />
+
+          {/* ✅ NEW: Max tickets per customer as a stat card */}
+          <StatCard
+            label="Max per customer"
+            value={`${raffle.max_tickets_per_customer ?? 3}`}
+            sub="Per raffle purchase limit"
           />
         </div>
 
@@ -758,6 +801,32 @@ export default function RaffleDetailPage() {
                   }}
                 />
               </div>
+            </div>
+
+            {/* ✅ NEW: Max tickets per customer */}
+            <div className="space-y-1">
+              <label
+                className="font-medium"
+                style={{ color: COLORS.textSecondary }}
+              >
+                Max tickets / customer
+              </label>
+              <input
+                type="number"
+                min="1"
+                max="1000"
+                value={maxTicketsPerCustomerDraft}
+                onChange={(e) => setMaxTicketsPerCustomerDraft(e.target.value)}
+                className="w-full border rounded px-3 py-2 text-sm"
+                style={{
+                  borderColor: COLORS.inputBorder,
+                  backgroundColor: COLORS.inputBg,
+                  color: COLORS.textPrimary,
+                }}
+              />
+              <p className="text-[0.7rem]" style={{ color: COLORS.textMuted }}>
+                Purchase limit per customer for this raffle (default: 3).
+              </p>
             </div>
           </div>
 

@@ -1,3 +1,4 @@
+// app/(admin)/raffles/[id]/edit/page.tsx
 "use client";
 
 import Image from "next/image";
@@ -17,6 +18,7 @@ type RaffleDetail = {
   sold_tickets: number | null;
   draw_date: string | null;
   item_image_url: string | null;
+  max_tickets_per_customer: number; // ✅ NEW
 };
 
 export default function EditRafflePage() {
@@ -34,6 +36,7 @@ export default function EditRafflePage() {
   const [ticketPrice, setTicketPrice] = useState("");
   const [totalTickets, setTotalTickets] = useState("");
   const [drawDate, setDrawDate] = useState("");
+  const [maxTicketsPerCustomer, setMaxTicketsPerCustomer] = useState("3"); // ✅ NEW
 
   const [currentImageUrl, setCurrentImageUrl] = useState<string | null>(null);
   const [imageFile, setImageFile] = useState<File | null>(null);
@@ -61,7 +64,7 @@ export default function EditRafflePage() {
         const { data, error } = await supabase
           .from("raffles")
           .select(
-            "id, item_name, item_description, ticket_price, total_tickets, sold_tickets, draw_date, item_image_url"
+            "id, item_name, item_description, ticket_price, total_tickets, sold_tickets, draw_date, item_image_url, max_tickets_per_customer"
           )
           .eq("id", raffleId)
           .maybeSingle<RaffleDetail>();
@@ -88,6 +91,7 @@ export default function EditRafflePage() {
             ? new Date(data.draw_date).toISOString().slice(0, 16)
             : ""
         );
+        setMaxTicketsPerCustomer(String(data.max_tickets_per_customer ?? 3));
         setCurrentImageUrl(data.item_image_url);
         setImagePreview(null);
         setImageFile(null);
@@ -132,6 +136,9 @@ export default function EditRafflePage() {
     const trimmedDesc = itemDescription.trim();
     const priceNumber = ticketPrice ? parseFloat(ticketPrice) : NaN;
     const totalTicketsNumber = totalTickets ? parseInt(totalTickets, 10) : NaN;
+    const maxPerCustomerNumber = maxTicketsPerCustomer
+      ? parseInt(maxTicketsPerCustomer, 10)
+      : NaN;
 
     if (!trimmedName) {
       setError("Item name is required.");
@@ -150,6 +157,17 @@ export default function EditRafflePage() {
 
     if (Number.isNaN(totalTicketsNumber) || totalTicketsNumber <= 0) {
       setError("Total tickets must be a positive integer.");
+      return;
+    }
+
+    if (
+      Number.isNaN(maxPerCustomerNumber) ||
+      maxPerCustomerNumber < 1 ||
+      maxPerCustomerNumber > 1000
+    ) {
+      setError(
+        "Max tickets per customer must be an integer between 1 and 1000."
+      );
       return;
     }
 
@@ -201,6 +219,7 @@ export default function EditRafflePage() {
         draw_date: string | null;
         item_image_url?: string | null;
         updated_at: string;
+        max_tickets_per_customer: number; // ✅ NEW
       } = {
         item_name: trimmedName,
         item_description: trimmedDesc,
@@ -208,6 +227,7 @@ export default function EditRafflePage() {
         total_tickets: totalTicketsNumber,
         draw_date: drawDate ? new Date(drawDate).toISOString() : null,
         updated_at: new Date().toISOString(),
+        max_tickets_per_customer: maxPerCustomerNumber,
       };
 
       updatePayload.item_image_url = imageUrl;
@@ -296,8 +316,8 @@ export default function EditRafflePage() {
             Edit raffle
           </h1>
           <p className="text-sm" style={{ color: COLORS.textSecondary }}>
-            Update prize information, pricing, ticket count, draw date and
-            image.
+            Update prize information, pricing, ticket count, draw date, image,
+            and per-customer ticket limit.
           </p>
         </div>
       </div>
@@ -396,7 +416,7 @@ export default function EditRafflePage() {
           </div>
 
           {/* Pricing + tickets */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="space-y-2">
               <label
                 className="text-sm font-medium"
@@ -443,6 +463,33 @@ export default function EditRafflePage() {
               <p className="text-xs" style={{ color: COLORS.textMuted }}>
                 Sold tickets: {raffle.sold_tickets ?? 0}. You cannot set the
                 total below this value.
+              </p>
+            </div>
+
+            {/* ✅ NEW */}
+            <div className="space-y-2">
+              <label
+                className="text-sm font-medium"
+                style={{ color: COLORS.textSecondary }}
+              >
+                Max tickets / customer
+              </label>
+              <input
+                type="number"
+                min="1"
+                max="1000"
+                value={maxTicketsPerCustomer}
+                onChange={(e) => setMaxTicketsPerCustomer(e.target.value)}
+                className="w-full border rounded px-3 py-2 text-sm"
+                style={{
+                  borderColor: COLORS.inputBorder,
+                  backgroundColor: COLORS.inputBg,
+                  color: COLORS.textPrimary,
+                }}
+                required
+              />
+              <p className="text-xs" style={{ color: COLORS.textMuted }}>
+                Default is 3. Applies per raffle.
               </p>
             </div>
           </div>

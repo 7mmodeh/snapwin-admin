@@ -17,6 +17,7 @@ type RaffleRow = {
   ticket_price: number | string;
   draw_date: string | null;
   created_at: string;
+  max_tickets_per_customer: number; // ✅ NEW
 };
 
 type StatusFilter = "all" | "active" | "soldout" | "drawn" | "cancelled";
@@ -36,7 +37,7 @@ export default function RafflesPage() {
         const { data, error } = await supabase
           .from("raffles")
           .select(
-            "id, item_name, item_image_url, status, total_tickets, sold_tickets, ticket_price, draw_date, created_at"
+            "id, item_name, item_image_url, status, total_tickets, sold_tickets, ticket_price, draw_date, created_at, max_tickets_per_customer"
           )
           .order("created_at", { ascending: false });
 
@@ -197,6 +198,7 @@ export default function RafflesPage() {
                     <Th className="text-right">Ticket price</Th>
                     <Th className="text-right">Tickets</Th>
                     <Th className="text-right">Sold %</Th>
+                    <Th className="text-right">Max / customer</Th>
                     <Th>Draw date</Th>
                     <Th>Created</Th>
                   </tr>
@@ -371,6 +373,13 @@ function RaffleRowItem({
             }}
           />
         </div>
+      </td>
+
+      {/* ✅ Max per customer */}
+      <td className="px-4 py-3 align-top text-right">
+        <span style={{ color: COLORS.textPrimary }}>
+          {raffle.max_tickets_per_customer ?? 3}
+        </span>
       </td>
 
       {/* Draw date */}
