@@ -1,7 +1,14 @@
 // app/(admin)/raffles/[id]/page.tsx
 "use client";
 
-import { ChangeEvent, useEffect, useMemo, useState } from "react";
+import {
+  ChangeEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useParams, useRouter } from "next/navigation";
 import Image from "next/image";
 import Link from "next/link";
@@ -20,6 +27,8 @@ type RaffleDetail = {
   ticket_price: number | string;
   draw_date: string | null;
   winner_id: string | null;
+  winning_ticket_id: string | null; // ✅ NEW (audit)
+  winning_ticket_number: number | null; // ✅ NEW (audit)
   item_image_url: string | null;
   created_at: string;
   updated_at: string | null;
@@ -65,6 +74,7 @@ export default function RaffleDetailPage() {
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [drawing, setDrawing] = useState(false); // ✅ NEW
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
@@ -91,94 +101,163 @@ export default function RaffleDetailPage() {
     };
   }, [imagePreview]);
 
-  useEffect(() => {
-    const fetchDetail = async () => {
-      try {
-        if (!raffleId) return;
-        setLoading(true);
-        setError(null);
-        setSuccess(null);
+  // ✅ Realtime: debounce refresh to avoid refetch storms
+  const realtimeRefreshTimerRef = useRef<number | null>(null);
+  const scheduleRefresh = useCallback(() => {
+    if (realtimeRefreshTimerRef.current) {
+      window.clearTimeout(realtimeRefreshTimerRef.current);
+    }
+    realtimeRefreshTimerRef.current = window.setTimeout(() => {
+      fetchDetail();
+    }, 350);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-        const [raffleRes, ticketsRes] = await Promise.all([
-          supabase
-            .from("raffles")
-            .select(
-              "id, item_name, item_description, status, total_tickets, sold_tickets, ticket_price, draw_date, winner_id, item_image_url, created_at, updated_at, max_tickets_per_customer"
-            )
-            .eq("id", raffleId)
-            .maybeSingle<RaffleDetail>(),
-          supabase
-            .from("tickets")
-            .select(
-              "id, ticket_number, customer_id, payment_status, is_winner, purchased_at, payment_amount"
-            )
-            .eq("raffle_id", raffleId)
-            .order("ticket_number", { ascending: true }),
-        ]);
+  const fetchDetail = useCallback(async () => {
+    try {
+      if (!raffleId) return;
+      setLoading(true);
+      setError(null);
+      setSuccess(null);
 
-        if (raffleRes.error) throw raffleRes.error;
-        if (!raffleRes.data) {
-          setError("Raffle not found.");
-          setLoading(false);
-          return;
-        }
-        if (ticketsRes.error) throw ticketsRes.error;
+      const [raffleRes, ticketsRes] = await Promise.all([
+        supabase
+          .from("raffles")
+          .select(
+            "id, item_name, item_description, status, total_tickets, sold_tickets, ticket_price, draw_date, winner_id, winning_ticket_id, winning_ticket_number, item_image_url, created_at, updated_at, max_tickets_per_customer"
+          )
+          .eq("id", raffleId)
+          .maybeSingle<RaffleDetail>(),
+        supabase
+          .from("tickets")
+          .select(
+            "id, ticket_number, customer_id, payment_status, is_winner, purchased_at, payment_amount"
+          )
+          .eq("raffle_id", raffleId)
+          .order("ticket_number", { ascending: true }),
+      ]);
 
-        const raffleData = raffleRes.data;
-        const ticketsData = (ticketsRes.data ?? []) as TicketRow[];
+      if (raffleRes.error) throw raffleRes.error;
+      if (!raffleRes.data) {
+        setError("Raffle not found.");
+        setLoading(false);
+        return;
+      }
+      if (ticketsRes.error) throw ticketsRes.error;
 
-        setRaffle(raffleData);
-        setTickets(ticketsData);
+      const raffleData = raffleRes.data;
+      const ticketsData = (ticketsRes.data ?? []) as TicketRow[];
 
-        // init drafts
-        setItemNameDraft(raffleData.item_name);
-        setItemDescriptionDraft(raffleData.item_description);
+      setRaffle(raffleData);
+      setTickets(ticketsData);
 
-        const price =
-          typeof raffleData.ticket_price === "number"
-            ? raffleData.ticket_price
-            : parseFloat(raffleData.ticket_price as string);
-        setTicketPriceDraft(Number.isNaN(price) ? "" : price.toFixed(2));
-        setTotalTicketsDraft(raffleData.total_tickets.toString());
+      // init drafts
+      setItemNameDraft(raffleData.item_name);
+      setItemDescriptionDraft(raffleData.item_description);
 
-        setStatusDraft(raffleData.status);
-        setDrawDateDraft(
-          raffleData.draw_date ? toDateTimeLocalValue(raffleData.draw_date) : ""
-        );
+      const price =
+        typeof raffleData.ticket_price === "number"
+          ? raffleData.ticket_price
+          : parseFloat(raffleData.ticket_price as string);
+      setTicketPriceDraft(Number.isNaN(price) ? "" : price.toFixed(2));
+      setTotalTicketsDraft(raffleData.total_tickets.toString());
 
-        // ✅ NEW
-        setMaxTicketsPerCustomerDraft(
-          String(raffleData.max_tickets_per_customer ?? 3)
-        );
+      setStatusDraft(raffleData.status);
+      setDrawDateDraft(
+        raffleData.draw_date ? toDateTimeLocalValue(raffleData.draw_date) : ""
+      );
 
-        // load winner details if any
-        if (raffleData.winner_id) {
-          const winnerRes = await supabase
-            .from("customers")
-            .select("id, name, email, phone, county")
-            .eq("id", raffleData.winner_id)
-            .maybeSingle<WinnerCustomer>();
+      // ✅ NEW
+      setMaxTicketsPerCustomerDraft(
+        String(raffleData.max_tickets_per_customer ?? 3)
+      );
 
-          if (!winnerRes.error && winnerRes.data) {
-            setWinner(winnerRes.data);
-          }
+      // load winner details if any
+      if (raffleData.winner_id) {
+        const winnerRes = await supabase
+          .from("customers")
+          .select("id, name, email, phone, county")
+          .eq("id", raffleData.winner_id)
+          .maybeSingle<WinnerCustomer>();
+
+        if (!winnerRes.error && winnerRes.data) {
+          setWinner(winnerRes.data);
         } else {
           setWinner(null);
         }
-      } catch (err: unknown) {
-        console.error("Error loading raffle detail:", err);
-        if (err instanceof Error) {
-          setError(err.message);
-        } else {
-          setError("Failed to load raffle details.");
-        }
-      } finally {
-        setLoading(false);
+      } else {
+        setWinner(null);
+      }
+    } catch (err: unknown) {
+      console.error("Error loading raffle detail:", err);
+      if (err instanceof Error) {
+        setError(err.message);
+      } else {
+        setError("Failed to load raffle details.");
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, [raffleId]);
+
+  useEffect(() => {
+    fetchDetail();
+  }, [fetchDetail]);
+
+  // ✅ NEW: Realtime subscriptions (raffles + tickets)
+  useEffect(() => {
+    if (!raffleId) return;
+
+    // Ensure any pending scheduled refresh is cleared on cleanup
+    const clearTimer = () => {
+      if (realtimeRefreshTimerRef.current) {
+        window.clearTimeout(realtimeRefreshTimerRef.current);
+        realtimeRefreshTimerRef.current = null;
       }
     };
 
-    fetchDetail();
-  }, [raffleId]);
+    // Subscribe to changes in tickets for this raffle
+    const ticketsChannel = supabase
+      .channel(`admin-raffle-${raffleId}-tickets`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "tickets",
+          filter: `raffle_id=eq.${raffleId}`,
+        },
+        () => {
+          // ticket insert/update (purchase, payment_status change, is_winner flip)
+          scheduleRefresh();
+        }
+      )
+      .subscribe();
+
+    // Subscribe to changes in raffles for this raffle
+    const rafflesChannel = supabase
+      .channel(`admin-raffle-${raffleId}-raffles`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "raffles",
+          filter: `id=eq.${raffleId}`,
+        },
+        () => {
+          // raffle updated (sold_tickets recompute, status change, draw audit written)
+          scheduleRefresh();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      clearTimer();
+      supabase.removeChannel(ticketsChannel);
+      supabase.removeChannel(rafflesChannel);
+    };
+  }, [raffleId, scheduleRefresh]);
 
   const stats = useMemo(() => {
     if (!raffle) {
@@ -328,6 +407,100 @@ export default function RaffleDetailPage() {
       }
     } finally {
       setSaving(false);
+    }
+  };
+
+  // ✅ NEW: draw action (calls hardened RPC)
+  const handleDrawWinner = async () => {
+    if (!raffleId || !raffle) return;
+
+    try {
+      setDrawing(true);
+      setError(null);
+      setSuccess(null);
+
+      const { data, error: rpcError } = await supabase.rpc(
+        "draw_raffle_winner",
+        { p_raffle_id: raffleId }
+      );
+
+      if (rpcError) throw rpcError;
+
+      // Supabase RPC may return an array (set-returning) or object depending on your function signature.
+      const row =
+        Array.isArray(data) && data.length
+          ? data[0]
+          : !Array.isArray(data)
+          ? data
+          : null;
+
+      if (!row) {
+        throw new Error("Draw completed but returned no data.");
+      }
+
+      const nextWinnerId: string | null = row.winner_id ?? null;
+      const nextWinningTicketId: string | null = row.winning_ticket_id ?? null;
+      const nextWinningTicketNumber: number | null =
+        row.winning_ticket_number ?? null;
+
+      // Update local raffle state immediately for UX
+      setRaffle((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: "drawn",
+              winner_id: nextWinnerId,
+              winning_ticket_id: nextWinningTicketId,
+              winning_ticket_number: nextWinningTicketNumber,
+              draw_date: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            }
+          : prev
+      );
+
+      // Fetch winner details (if any)
+      if (nextWinnerId) {
+        const winnerRes = await supabase
+          .from("customers")
+          .select("id, name, email, phone, county")
+          .eq("id", nextWinnerId)
+          .maybeSingle<WinnerCustomer>();
+
+        if (!winnerRes.error && winnerRes.data) {
+          setWinner(winnerRes.data);
+        } else {
+          setWinner(null);
+        }
+      } else {
+        setWinner(null);
+      }
+
+      // Refresh tickets so is_winner reflects trigger updates
+      const ticketsRes = await supabase
+        .from("tickets")
+        .select(
+          "id, ticket_number, customer_id, payment_status, is_winner, purchased_at, payment_amount"
+        )
+        .eq("raffle_id", raffleId)
+        .order("ticket_number", { ascending: true });
+
+      if (ticketsRes.error) throw ticketsRes.error;
+      setTickets((ticketsRes.data ?? []) as TicketRow[]);
+
+      setSuccess(
+        nextWinningTicketNumber != null
+          ? `Winner drawn successfully. Winning ticket #${nextWinningTicketNumber}.`
+          : "Winner drawn successfully."
+      );
+    } catch (err: unknown) {
+      console.error("Error drawing winner:", err);
+      if (err instanceof Error) {
+        setError(err.message);
+      } else {
+        setError("Failed to draw winner.");
+      }
+    } finally {
+      setDrawing(false);
     }
   };
 
@@ -497,6 +670,12 @@ export default function RaffleDetailPage() {
 
   const currentImageSrc = raffle.item_image_url || "/vercel.svg";
 
+  const canDraw =
+    raffle.status === "soldout" &&
+    (raffle.sold_tickets ?? 0) >= raffle.total_tickets;
+
+  const alreadyDrawn = raffle.status === "drawn";
+
   return (
     <div className="space-y-6">
       {/* Top header */}
@@ -527,6 +706,18 @@ export default function RaffleDetailPage() {
               {raffle.max_tickets_per_customer ?? 3}
             </span>
           </p>
+
+          {/* ✅ NEW: Show winning ticket audit details if drawn */}
+          {alreadyDrawn && (
+            <p className="text-xs mt-2" style={{ color: COLORS.textMuted }}>
+              Winning ticket:{" "}
+              <span style={{ color: COLORS.textSecondary, fontWeight: 700 }}>
+                {raffle.winning_ticket_number != null
+                  ? `#${raffle.winning_ticket_number}`
+                  : "-"}
+              </span>
+            </p>
+          )}
         </div>
 
         <div className="flex flex-col items-start md:items-end gap-2">
@@ -610,6 +801,19 @@ export default function RaffleDetailPage() {
             value={`${raffle.max_tickets_per_customer ?? 3}`}
             sub="Per raffle purchase limit"
           />
+
+          {/* ✅ NEW: Winning ticket as a stat card when drawn */}
+          {alreadyDrawn && (
+            <StatCard
+              label="Winning ticket"
+              value={
+                raffle.winning_ticket_number != null
+                  ? `#${raffle.winning_ticket_number}`
+                  : "-"
+              }
+              sub="Stored on raffle"
+            />
+          )}
         </div>
 
         {/* Controls */}
@@ -627,6 +831,68 @@ export default function RaffleDetailPage() {
           >
             Raffle controls
           </h2>
+
+          {/* ✅ NEW: Draw winner block */}
+          <div className="space-y-2 text-sm">
+            <div
+              className="font-medium"
+              style={{ color: COLORS.textSecondary }}
+            >
+              Draw winner
+            </div>
+
+            {alreadyDrawn ? (
+              <div
+                className="rounded px-3 py-2 text-xs"
+                style={{
+                  backgroundColor: COLORS.highlightCardBg,
+                  borderColor: COLORS.cardBorder,
+                  borderWidth: 1,
+                  color: COLORS.textSecondary,
+                }}
+              >
+                This raffle is already drawn.
+                <div className="mt-1" style={{ color: COLORS.textMuted }}>
+                  Winning ticket:{" "}
+                  {raffle.winning_ticket_number != null
+                    ? `#${raffle.winning_ticket_number}`
+                    : "-"}
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <p className="text-xs" style={{ color: COLORS.textMuted }}>
+                  Allowed only when status is <b>sold out</b> and all tickets
+                  are sold. This action is idempotent and will not re-draw once
+                  completed.
+                </p>
+
+                <button
+                  type="button"
+                  onClick={handleDrawWinner}
+                  disabled={!canDraw || drawing}
+                  className="w-full rounded py-2 text-xs font-medium"
+                  style={{
+                    backgroundColor: COLORS.primaryButtonBg,
+                    color: COLORS.primaryButtonText,
+                    opacity: !canDraw || drawing ? 0.5 : 1,
+                  }}
+                >
+                  {drawing ? "Drawing..." : "Draw winner now"}
+                </button>
+
+                {!canDraw && (
+                  <p
+                    className="text-[0.7rem]"
+                    style={{ color: COLORS.textMuted }}
+                  >
+                    To draw: status must be <b>sold out</b> and sold tickets
+                    must equal total tickets.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
 
           {/* Image section */}
           <div className="space-y-2 text-sm">
@@ -888,22 +1154,19 @@ export default function RaffleDetailPage() {
             </p>
           </div>
 
-          {/* Draw actions link */}
-          <div className="space-y-1">
-            <span
-              className="text-sm font-medium"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Draw actions
-            </span>
-            <a
-              href={`/draw/${raffle.id}`}
-              className="text-sm underline"
-              style={{ color: COLORS.primary }}
-            >
-              Open draw tool (to be wired)
-            </a>
-          </div>
+          {/* Refresh */}
+          <button
+            type="button"
+            onClick={fetchDetail}
+            className="w-full rounded py-2 text-xs font-medium border"
+            style={{
+              borderColor: COLORS.cardBorder,
+              backgroundColor: COLORS.cardBg,
+              color: COLORS.primary,
+            }}
+          >
+            Refresh data
+          </button>
 
           {/* Save button */}
           <button
@@ -937,6 +1200,7 @@ export default function RaffleDetailPage() {
         >
           Winner
         </h2>
+
         {raffle.status !== "drawn" || !raffle.winner_id ? (
           <p className="text-sm" style={{ color: COLORS.textMuted }}>
             No winner has been set yet.
@@ -957,6 +1221,16 @@ export default function RaffleDetailPage() {
             <div style={{ color: COLORS.textSecondary }}>
               {winner.phone && <>Phone: {winner.phone} · </>}
               {winner.county && <>County: {winner.county}</>}
+            </div>
+
+            {/* ✅ NEW: winning ticket audit */}
+            <div className="text-xs mt-2" style={{ color: COLORS.textMuted }}>
+              Winning ticket:{" "}
+              <span style={{ color: COLORS.textSecondary, fontWeight: 700 }}>
+                {raffle.winning_ticket_number != null
+                  ? `#${raffle.winning_ticket_number}`
+                  : "-"}
+              </span>
             </div>
           </div>
         ) : (
