@@ -40,17 +40,19 @@ type TicketDetail = {
     ticket_price: number;
     status: string;
   } | null;
-  customers?: { id: string; email: string } | null;
+  customers?: { id: string; email: string; name?: string | null } | null;
 };
 
 type TicketDetailRaw = Omit<TicketDetail, "raffles" | "customers"> & {
+  // With explicit FK pinning + aliasing, these come back as *single objects* (or null),
+  // but we still accept OneOrMany for safety across environments.
   raffles?: OneOrMany<{
     id: string;
     item_name: string;
     ticket_price: number;
     status: string;
   }>;
-  customers?: OneOrMany<{ id: string; email: string }>;
+  customers?: OneOrMany<{ id: string; email: string; name?: string | null }>;
 };
 
 function firstOrNull<T>(v: OneOrMany<T> | undefined): T | null {
@@ -129,6 +131,13 @@ export default function AdminTicketDetailPage() {
       setLoading(true);
       setError(null);
 
+      // ✅ IMPORTANT: pin the FK relationships explicitly to avoid PGRST201 ambiguity
+      // - tickets -> raffles can be ambiguous if raffles has winning_ticket_id etc.
+      // - use FK names from Supabase hint:
+      //   raffles!tickets_raffle_id_fkey
+      //   customers!tickets_customer_id_fkey
+      //
+      // Keep the original property names (raffles/customers) so the rest of the file is unchanged.
       const { data, error: qErr } = await supabase
         .from("tickets")
         .select(
@@ -148,8 +157,8 @@ export default function AdminTicketDetailPage() {
             payment_error,
             is_winner,
             created_at,
-            raffles ( id, item_name, ticket_price, status ),
-            customers ( id, email )
+            raffles:raffles!tickets_raffle_id_fkey ( id, item_name, ticket_price, status ),
+            customers:customers!tickets_customer_id_fkey ( id, email, name )
           `
         )
         .eq("id", ticketId)
@@ -297,6 +306,11 @@ export default function AdminTicketDetailPage() {
 
   if (!ticket) return null;
 
+  const customerDisplay =
+    ticket.customers?.name?.trim() ||
+    ticket.customers?.email?.trim() ||
+    ticket.customer_id;
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -398,10 +412,12 @@ export default function AdminTicketDetailPage() {
                 className="underline"
                 style={{ color: COLORS.primary }}
               >
-                {ticket.customers?.email ?? ticket.customer_id}
+                {customerDisplay}
               </Link>
               <div className="text-xs" style={{ color: COLORS.textMuted }}>
-                Customer ID: {ticket.customer_id}
+                {ticket.customers?.email
+                  ? `Email: ${ticket.customers.email}`
+                  : `Customer ID: ${ticket.customer_id}`}
               </div>
             </div>
           )}
