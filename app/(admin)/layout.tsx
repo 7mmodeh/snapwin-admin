@@ -94,7 +94,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
     return (
       <div
         className="flex items-center justify-center h-screen"
-        style={{ backgroundColor: COLORS.background }}
+        style={{ backgroundColor: COLORS.screenBg }}
       >
         <span style={{ color: COLORS.textSecondary }}>
           Checking admin access...
@@ -127,6 +127,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
           >
             Dashboard
           </Link>
+
           <Link
             href="/raffles"
             className="hover:underline"
@@ -134,6 +135,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
           >
             Raffles
           </Link>
+
           <Link
             href="/customers"
             className="hover:underline"
@@ -141,6 +143,16 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
           >
             Customers
           </Link>
+
+          {/* ✅ NEW: Tickets */}
+          <Link
+            href="/tickets"
+            className="hover:underline"
+            style={{ color: COLORS.textPrimary }}
+          >
+            Tickets
+          </Link>
+
           <Link
             href="/payments"
             className="hover:underline"
@@ -148,6 +160,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
           >
             Payments
           </Link>
+
           <Link
             href="/support"
             className="hover:underline"
@@ -155,6 +168,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
           >
             Support
           </Link>
+
           <Link
             href="/notifications"
             className="hover:underline"
