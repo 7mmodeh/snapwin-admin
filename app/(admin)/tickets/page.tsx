@@ -9,14 +9,6 @@ import { COLORS } from "@/lib/colors";
 type PaymentStatus = "pending" | "completed" | "failed";
 type StatusFilter = PaymentStatus | "all";
 
-/**
- * Supabase nested select may return:
- * - a single object (if relationship is recognized)
- * - an array of objects (common when relationship inference differs)
- * - null
- */
-type OneOrMany<T> = T | T[] | null;
-
 type TicketRow = {
   id: string;
   raffle_id: string;
@@ -39,24 +31,18 @@ type TicketRow = {
 
   created_at: string | null;
 
-  raffles?: {
-    id: string;
-    item_name: string;
-  } | null;
-
-  customers?: {
-    id: string;
-    email: string;
-  } | null;
+  // We alias these in the query so the shape is stable and unambiguous.
+  raffle: { id: string; item_name: string } | null;
+  customer: { id: string; email: string } | null;
 };
 
 /**
- * Raw shape returned from Supabase for this query.
- * Note: nested relations can arrive as OneOrMany<...>
+ * Raw shape returned from Supabase for this query (unknown-safe).
+ * Note: raffle/customer can be object or null.
  */
-type TicketRowRaw = Omit<TicketRow, "raffles" | "customers"> & {
-  raffles?: OneOrMany<{ id: string; item_name: string }>;
-  customers?: OneOrMany<{ id: string; email: string }>;
+type TicketRowRaw = Omit<TicketRow, "raffle" | "customer"> & {
+  raffle?: unknown;
+  customer?: unknown;
 };
 
 const PAGE_SIZE = 25;
@@ -80,11 +66,6 @@ function shortId(id?: string | null) {
   return id.length > 10 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
 }
 
-function firstOrNull<T>(v: OneOrMany<T> | undefined): T | null {
-  if (!v) return null;
-  return Array.isArray(v) ? v[0] ?? null : v;
-}
-
 function isStatusFilter(v: string): v is StatusFilter {
   return v === "all" || v === "pending" || v === "completed" || v === "failed";
 }
@@ -98,12 +79,31 @@ function escapeIlike(input: string) {
   return input.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
 }
 
+// Minimal runtime guards to keep TS strict and avoid `any`/unsafe casts.
+function isObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+function toRaffleSummary(v: unknown): TicketRow["raffle"] {
+  if (!isObj(v)) return null;
+  const id = typeof v.id === "string" ? v.id : null;
+  const item_name = typeof v.item_name === "string" ? v.item_name : null;
+  if (!id || !item_name) return null;
+  return { id, item_name };
+}
+function toCustomerSummary(v: unknown): TicketRow["customer"] {
+  if (!isObj(v)) return null;
+  const id = typeof v.id === "string" ? v.id : null;
+  const email = typeof v.email === "string" ? v.email : null;
+  if (!id || !email) return null;
+  return { id, email };
+}
+
 export default function AdminTicketsPage() {
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
 
   // Filters
-  const [q, setQ] = useState(""); // searches ticket_code, session_id, payment_intent_id
+  const [q, setQ] = useState("");
   const [status, setStatus] = useState<StatusFilter>("all");
   const [winnerOnly, setWinnerOnly] = useState(false);
   const [raffleId, setRaffleId] = useState("");
@@ -114,7 +114,7 @@ export default function AdminTicketsPage() {
   const [rows, setRows] = useState<TicketRow[]>([]);
   const [totalCount, setTotalCount] = useState<number>(0);
 
-  // Debounce query so we don’t spam Supabase
+  // Debounce query
   const qRef = useRef<number | null>(null);
   const [qDebounced, setQDebounced] = useState("");
   useEffect(() => {
@@ -162,8 +162,10 @@ export default function AdminTicketsPage() {
             payment_error,
             is_winner,
             created_at,
-            raffles ( id, item_name ),
-            customers ( id, email )
+
+            -- ✅ IMPORTANT: pin the FK relationship explicitly to avoid ambiguity
+            raffle:raffles!tickets_raffle_id_fkey ( id, item_name ),
+            customer:customers!tickets_customer_id_fkey ( id, email )
           `,
           { count: "exact" }
         )
@@ -175,12 +177,10 @@ export default function AdminTicketsPage() {
       if (raffleId.trim()) query = query.eq("raffle_id", raffleId.trim());
       if (customerId.trim()) query = query.eq("customer_id", customerId.trim());
 
-      // Ticket-side search only (safe / reliable)
+      // Ticket-side search
       const search = qDebounced;
       if (search) {
-        // Avoid LIKE wildcard surprises and keep queries consistent
         const s = escapeIlike(search);
-
         query = query.or(
           [
             `ticket_code.ilike.%${s}%`,
@@ -190,15 +190,12 @@ export default function AdminTicketsPage() {
         );
       }
 
-      // Fetch and then normalize types explicitly (prevents `any` + “conversion may be a mistake” warnings)
       const res = await query.range(from, to);
 
       const error: PostgrestError | null =
         (res as { error: PostgrestError | null }).error ?? null;
-
       const count: number | null =
         (res as { count: number | null }).count ?? null;
-
       const dataUnknown: unknown = (res as { data: unknown }).data ?? null;
 
       if (error) throw error;
@@ -207,11 +204,29 @@ export default function AdminTicketsPage() {
         ? (dataUnknown as unknown as TicketRowRaw[])
         : [];
 
-      // Normalize nested relations so UI always receives single objects or null
       const normalized: TicketRow[] = rawRows.map((r) => ({
-        ...r,
-        raffles: firstOrNull(r.raffles),
-        customers: firstOrNull(r.customers),
+        id: r.id,
+        raffle_id: r.raffle_id,
+        customer_id: r.customer_id,
+        ticket_number: r.ticket_number,
+        ticket_code: r.ticket_code ?? null,
+
+        payment_status: r.payment_status,
+        payment_intent_id: r.payment_intent_id ?? null,
+        checkout_session_id: r.checkout_session_id ?? null,
+
+        payment_amount: r.payment_amount ?? null,
+        payment_currency: r.payment_currency ?? null,
+        payment_method: r.payment_method ?? null,
+
+        payment_completed_at: r.payment_completed_at ?? null,
+        payment_error: r.payment_error ?? null,
+
+        is_winner: r.is_winner ?? null,
+        created_at: r.created_at ?? null,
+
+        raffle: toRaffleSummary(r.raffle),
+        customer: toCustomerSummary(r.customer),
       }));
 
       setRows(normalized);
@@ -232,8 +247,7 @@ export default function AdminTicketsPage() {
     fetchTickets();
   }, [fetchTickets]);
 
-  // Realtime refresh: if any ticket changes, re-fetch current page.
-  // Throttle bursts to a single fetch (prevents “spam fetch” during draws/imports)
+  // Realtime refresh: throttle bursts to a single fetch
   const rtTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -342,8 +356,7 @@ export default function AdminTicketsPage() {
               placeholder="e.g. SW-000123-AB12CD or cs_test_... or pi_..."
             />
             <p className="text-xs" style={{ color: COLORS.textMuted }}>
-              This search targets ticket fields only. For customer email search,
-              add a 2-step lookup later.
+              This search targets ticket fields only.
             </p>
           </div>
 
@@ -460,21 +473,19 @@ export default function AdminTicketsPage() {
               Results
             </div>
 
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={() => fetchTickets()}
-                className="px-4 py-2 rounded-full text-sm font-medium border"
-                style={{
-                  borderColor: COLORS.cardBorder,
-                  color: COLORS.textSecondary,
-                  backgroundColor: COLORS.cardBg,
-                }}
-                disabled={loading}
-              >
-                {loading ? "Refreshing..." : "Refresh"}
-              </button>
-            </div>
+            <button
+              type="button"
+              onClick={() => fetchTickets()}
+              className="px-4 py-2 rounded-full text-sm font-medium border"
+              style={{
+                borderColor: COLORS.cardBorder,
+                color: COLORS.textSecondary,
+                backgroundColor: COLORS.cardBg,
+              }}
+              disabled={loading}
+            >
+              {loading ? "Refreshing..." : "Refresh"}
+            </button>
           </div>
         </div>
 
@@ -497,6 +508,7 @@ export default function AdminTicketsPage() {
                 <th className="px-5 py-3 font-medium">Refs</th>
               </tr>
             </thead>
+
             <tbody>
               {loading ? (
                 <tr>
@@ -520,8 +532,8 @@ export default function AdminTicketsPage() {
                 </tr>
               ) : (
                 rows.map((t) => {
-                  const raffleName = t.raffles?.item_name ?? "—";
-                  const custEmail = t.customers?.email ?? "—";
+                  const raffleName = t.raffle?.item_name ?? "—";
+                  const custEmail = t.customer?.email ?? "—";
                   const created = t.created_at
                     ? new Date(t.created_at).toLocaleString("en-IE")
                     : "—";
@@ -636,6 +648,7 @@ export default function AdminTicketsPage() {
                         >
                           {statusLabel}
                         </span>
+
                         {t.payment_status === "failed" && t.payment_error ? (
                           <div
                             className="text-xs mt-1"
@@ -732,6 +745,7 @@ export default function AdminTicketsPage() {
             >
               Prev
             </button>
+
             <button
               type="button"
               className="px-4 py-2 rounded-full text-sm font-medium"
@@ -749,7 +763,7 @@ export default function AdminTicketsPage() {
         </div>
       </div>
 
-      {/* Admin ops notes */}
+      {/* Notes */}
       <div
         className="rounded-2xl p-5 border text-sm"
         style={{
