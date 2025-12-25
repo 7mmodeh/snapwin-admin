@@ -1,6 +1,15 @@
+// app/(admin)/customers/[id]/page.tsx
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent,
+  type SyntheticEvent,
+} from "react";
 import { useParams, useRouter } from "next/navigation";
 import type { PostgrestError, RealtimeChannel } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabaseClient";
@@ -24,13 +33,13 @@ type CustomerTicket = {
   raffle_id: string;
   customer_id: string;
   ticket_number: number;
-  ticket_code: string | null; // ✅ latest model
-  payment_status: PaymentStatus | string; // ✅ tolerate legacy/unexpected values
+  ticket_code: string | null;
+  payment_status: PaymentStatus | string;
   is_winner: boolean | null;
   purchased_at: string | null;
-  payment_amount: number | null; // ✅ normalized
+  payment_amount: number | null;
 
-  raffle: { id: string; item_name: string } | null; // ✅ show raffle name + link
+  raffle: { id: string; item_name: string } | null;
 };
 
 type CustomerDetailRaw = Record<string, unknown>;
@@ -108,9 +117,8 @@ function normalizeTicket(raw: CustomerTicketRaw): CustomerTicket | null {
       ? raw.ticket_number
       : parseInt(String(raw.ticket_number ?? ""), 10);
 
-  if (!id || !raffle_id || !customer_id || !Number.isFinite(ticket_number)) {
+  if (!id || !raffle_id || !customer_id || !Number.isFinite(ticket_number))
     return null;
-  }
 
   return {
     id,
@@ -134,7 +142,7 @@ function formatAmount(amount: number | null): string {
   return amount.toFixed(2);
 }
 
-function stopRowNav(e: React.SyntheticEvent) {
+function stopRowNav(e: SyntheticEvent) {
   e.stopPropagation();
 }
 
@@ -149,14 +157,13 @@ function CopyButton({
 }) {
   const [copied, setCopied] = useState(false);
 
-  const onCopy = async (e: React.MouseEvent) => {
+  const onCopy = async (e: MouseEvent<HTMLButtonElement>) => {
     e.stopPropagation();
     try {
       await navigator.clipboard.writeText(value);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 900);
     } catch {
-      // fallback
       try {
         const ta = document.createElement("textarea");
         ta.value = value;
@@ -192,26 +199,44 @@ function CopyButton({
   );
 }
 
+function getParamId(params: unknown): string | null {
+  if (!params || typeof params !== "object") return null;
+  const v = (params as Record<string, unknown>).id;
+
+  if (typeof v === "string" && v.trim()) return v.trim();
+  if (Array.isArray(v) && typeof v[0] === "string" && v[0].trim())
+    return v[0].trim();
+
+  return null;
+}
+
 export default function CustomerDetailPage() {
-  const params = useParams<{ id: string }>();
+  const params = useParams();
   const router = useRouter();
-  const customerId = params.id;
+
+  const customerId = useMemo(() => getParamId(params), [params]);
 
   const [customer, setCustomer] = useState<CustomerDetail | null>(null);
   const [tickets, setTickets] = useState<CustomerTicket[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Throttle realtime bursts
   const rtTimerRef = useRef<number | null>(null);
+  const channelRef = useRef<RealtimeChannel | null>(null);
 
   const fetchDetail = useCallback(async () => {
+    setError(null);
+
+    if (!customerId) {
+      setCustomer(null);
+      setTickets([]);
+      setLoading(false);
+      setError("Missing customer ID in route.");
+      return;
+    }
+
+    setLoading(true);
     try {
-      if (!customerId) return;
-
-      setLoading(true);
-      setError(null);
-
       const [customerRes, ticketsRes] = await Promise.all([
         supabase
           .from("customers")
@@ -224,29 +249,31 @@ export default function CustomerDetailPage() {
           .from("tickets")
           .select(
             `
-              id,
-              raffle_id,
-              customer_id,
-              ticket_number,
-              ticket_code,
-              payment_status,
-              is_winner,
-              purchased_at,
-              payment_amount,
-              raffle:raffles!tickets_raffle_id_fkey ( id, item_name )
-            `
+            id,
+            raffle_id,
+            customer_id,
+            ticket_number,
+            ticket_code,
+            payment_status,
+            is_winner,
+            purchased_at,
+            payment_amount,
+            raffle:raffles!tickets_raffle_id_fkey ( id, item_name )
+          `
           )
           .eq("customer_id", customerId)
           .order("purchased_at", { ascending: false }),
       ]);
 
       if (customerRes.error) throw customerRes.error;
+
       if (!customerRes.data) {
         setCustomer(null);
         setTickets([]);
         setError("Customer not found.");
         return;
       }
+
       if (ticketsRes.error) throw ticketsRes.error;
 
       const custNorm = normalizeCustomer(
@@ -290,8 +317,13 @@ export default function CustomerDetailPage() {
     fetchDetail();
   }, [fetchDetail]);
 
-  // Optional realtime refresh
   useEffect(() => {
+    // Ensure we never keep old subscriptions alive
+    if (channelRef.current) {
+      supabase.removeChannel(channelRef.current);
+      channelRef.current = null;
+    }
+
     if (!customerId) return;
 
     const scheduleRefresh = () => {
@@ -315,9 +347,14 @@ export default function CustomerDetailPage() {
       )
       .subscribe();
 
+    channelRef.current = channel;
+
     return () => {
       if (rtTimerRef.current) window.clearTimeout(rtTimerRef.current);
-      supabase.removeChannel(channel);
+      if (channelRef.current) {
+        supabase.removeChannel(channelRef.current);
+        channelRef.current = null;
+      }
     };
   }, [customerId, fetchDetail]);
 
@@ -344,7 +381,6 @@ export default function CustomerDetailPage() {
       } else if (t.payment_status === "failed") {
         failedTickets += 1;
       }
-
       if (t.is_winner) wins += 1;
     }
 
@@ -357,7 +393,6 @@ export default function CustomerDetailPage() {
     };
   }, [tickets]);
 
-  // Export tickets as CSV
   const handleExportTickets = () => {
     if (!tickets.length || !customer) return;
 
@@ -397,9 +432,9 @@ export default function CustomerDetailPage() {
         .join("\n") + "\n";
 
     const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
+
     const safeName = customer.name
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
@@ -413,13 +448,14 @@ export default function CustomerDetailPage() {
     URL.revokeObjectURL(url);
   };
 
+  // IMPORTANT: keep these consistent with your admin routes you already use elsewhere
   const goTicket = (ticketId: string) => router.push(`/tickets/${ticketId}`);
   const goRaffle = (raffleId: string) => router.push(`/raffles/${raffleId}`);
 
   if (loading) {
     return (
       <div
-        className="flex items-center justify-center h-full"
+        className="flex items-center justify-center min-h-[40vh]"
         style={{ color: COLORS.textSecondary }}
       >
         Loading customer...
@@ -427,6 +463,7 @@ export default function CustomerDetailPage() {
     );
   }
 
+  // Always show an error UI if we have no customer
   if (error && !customer) {
     return (
       <div className="space-y-4">
@@ -438,17 +475,43 @@ export default function CustomerDetailPage() {
         >
           ← Back
         </button>
+
         <div
           className="rounded px-4 py-3 text-sm"
           style={{ backgroundColor: "#FEE2E2", color: COLORS.error }}
         >
           {error}
         </div>
+
+        <div className="text-xs" style={{ color: COLORS.textMuted }}>
+          If you keep seeing “Missing customer ID in route”, your
+          link/navigation to this page is wrong. The URL must be{" "}
+          <span style={{ color: COLORS.textPrimary }}>
+            {" "}
+            /customers/&lt;uuid&gt;{" "}
+          </span>
+          .
+        </div>
       </div>
     );
   }
 
-  if (!customer) return null;
+  // Never return null → avoid blank screens
+  if (!customer) {
+    return (
+      <div className="space-y-4">
+        <button
+          type="button"
+          onClick={() => router.back()}
+          className="text-sm underline"
+          style={{ color: COLORS.primary }}
+        >
+          ← Back
+        </button>
+        <div style={{ color: COLORS.textSecondary }}>No customer loaded.</div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -463,12 +526,14 @@ export default function CustomerDetailPage() {
           >
             ← Back to customers
           </button>
+
           <h1
             className="text-3xl font-bold mb-1"
             style={{ color: COLORS.primary }}
           >
             {customer.name}
           </h1>
+
           <p style={{ color: COLORS.textSecondary }}>{customer.email}</p>
 
           <div className="flex flex-wrap gap-2 mt-2">
@@ -510,7 +575,6 @@ export default function CustomerDetailPage() {
 
       {/* Info + stats */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Info card */}
         <div
           className="rounded-lg p-4 lg:col-span-2"
           style={{
@@ -540,7 +604,6 @@ export default function CustomerDetailPage() {
           </div>
         </div>
 
-        {/* Stats card */}
         <div
           className="rounded-lg p-4 space-y-3"
           style={{
@@ -626,6 +689,7 @@ export default function CustomerDetailPage() {
                   <th className="px-3 py-2 text-left">Actions</th>
                 </tr>
               </thead>
+
               <tbody>
                 {tickets.map((t) => (
                   <tr
@@ -804,7 +868,7 @@ function TicketStatusBadge({
   status: CustomerTicket["payment_status"];
 }) {
   let bg = COLORS.info;
-  let label: string = String(status ?? "");
+  let label = String(status ?? "");
 
   if (status === "completed") {
     bg = COLORS.success;
