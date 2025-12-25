@@ -19,12 +19,100 @@ type CustomerPick = {
   expo_push_token: string | null;
 };
 
+type RafflePick = {
+  id: string;
+  item_name: string;
+  status: string;
+  draw_date: string | null;
+};
+
 function escapeIlike(input: string) {
   return input.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
 }
 
 function uniqStrings(xs: string[]) {
   return Array.from(new Set(xs.map((x) => x.trim()).filter(Boolean)));
+}
+
+function formatShortId(id: string) {
+  return id.length > 14 ? `${id.slice(0, 10)}…${id.slice(-4)}` : id;
+}
+
+function formatDateMaybe(v: string | null) {
+  if (!v) return "—";
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return v;
+  return d.toLocaleString("en-IE");
+}
+
+function stopPropagation(e: React.SyntheticEvent) {
+  e.stopPropagation();
+}
+
+function SearchSelect({
+  label,
+  placeholder,
+  query,
+  setQuery,
+  results,
+  loading,
+  emptyHint,
+}: {
+  label: string;
+  placeholder: string;
+  query: string;
+  setQuery: (v: string) => void;
+  results: React.ReactNode;
+  loading: boolean;
+  emptyHint: string;
+  renderRow?: never;
+}) {
+  // This is a lightweight wrapper for consistent styling.
+  return (
+    <div className="space-y-2">
+      <label
+        className="text-sm font-medium"
+        style={{ color: COLORS.textSecondary }}
+      >
+        {label}
+      </label>
+
+      <input
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        className="w-full border rounded px-3 py-2 text-sm"
+        style={{
+          borderColor: COLORS.inputBorder,
+          backgroundColor: COLORS.inputBg,
+          color: COLORS.textPrimary,
+        }}
+        placeholder={placeholder}
+      />
+
+      <div
+        className="rounded-xl border mt-2 overflow-hidden"
+        style={{ borderColor: COLORS.cardBorder }}
+      >
+        {loading ? (
+          <div
+            className="px-3 py-3 text-sm"
+            style={{ color: COLORS.textMuted }}
+          >
+            Loading…
+          </div>
+        ) : results ? (
+          results
+        ) : (
+          <div
+            className="px-3 py-3 text-sm"
+            style={{ color: COLORS.textMuted }}
+          >
+            {emptyHint}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 export default function AdminSendNotificationPage() {
@@ -35,8 +123,15 @@ export default function AdminSendNotificationPage() {
   // Campaign targeting
   const [mode, setMode] = useState<Mode>("all_users");
 
-  // raffle targeting
+  // raffle targeting (human-friendly picker -> still writes raffleId string)
   const [raffleId, setRaffleId] = useState("");
+  const [raffleQuery, setRaffleQuery] = useState("");
+  const [raffleQueryDebounced, setRaffleQueryDebounced] = useState("");
+  const raffleTimerRef = useRef<number | null>(null);
+  const [raffles, setRaffles] = useState<RafflePick[]>([]);
+  const [rafflesLoading, setRafflesLoading] = useState(false);
+
+  // multi raffle union
   const [raffleIdsMulti, setRaffleIdsMulti] = useState(""); // textarea, one per line or comma
   const [onlyCompletedTickets, setOnlyCompletedTickets] = useState(true);
 
@@ -59,6 +154,7 @@ export default function AdminSendNotificationPage() {
   const [body, setBody] = useState("");
   const [dataJson, setDataJson] = useState(`{"source":"admin"}`);
 
+  // Debounce customer search
   useEffect(() => {
     if (tRef.current) window.clearTimeout(tRef.current);
     tRef.current = window.setTimeout(
@@ -69,6 +165,18 @@ export default function AdminSendNotificationPage() {
       if (tRef.current) window.clearTimeout(tRef.current);
     };
   }, [customerQuery]);
+
+  // Debounce raffle search
+  useEffect(() => {
+    if (raffleTimerRef.current) window.clearTimeout(raffleTimerRef.current);
+    raffleTimerRef.current = window.setTimeout(
+      () => setRaffleQueryDebounced(raffleQuery.trim()),
+      250
+    );
+    return () => {
+      if (raffleTimerRef.current) window.clearTimeout(raffleTimerRef.current);
+    };
+  }, [raffleQuery]);
 
   const loadCustomers = useCallback(async () => {
     setErrorMsg(null);
@@ -101,6 +209,86 @@ export default function AdminSendNotificationPage() {
   useEffect(() => {
     loadCustomers();
   }, [loadCustomers]);
+
+  const loadRaffles = useCallback(async () => {
+    // Only load when a raffle is relevant to the current mode, to reduce noise.
+    const raffleRelevant = mode === "raffle_users" || mode === "attempt_status";
+    if (!raffleRelevant) {
+      setRaffles([]);
+      return;
+    }
+
+    setErrorMsg(null);
+    const q = raffleQueryDebounced.trim();
+
+    setRafflesLoading(true);
+    try {
+      // “current raffles” for admin selection: active + soldout by default
+      let query = supabase
+        .from("raffles")
+        .select("id,item_name,status,draw_date")
+        .in("status", ["active", "soldout"])
+        .order("created_at", { ascending: false })
+        .limit(12);
+
+      if (q) query = query.ilike("item_name", `%${escapeIlike(q)}%`);
+
+      const { data, error } = await query;
+      if (error) throw error;
+
+      const list: unknown = data ?? [];
+      const normalized: RafflePick[] = Array.isArray(list)
+        ? (list as unknown[]).map((r) => {
+            const obj = (r ?? {}) as Record<string, unknown>;
+            return {
+              id: String(obj.id ?? ""),
+              item_name: String(obj.item_name ?? ""),
+              status: String(obj.status ?? ""),
+              draw_date: (obj.draw_date as string | null) ?? null,
+            };
+          })
+        : [];
+
+      setRaffles(
+        normalized.filter((x) => x.id && x.item_name) // basic guard
+      );
+    } catch (e: unknown) {
+      setRaffles([]);
+      setErrorMsg(e instanceof Error ? e.message : "Failed to load raffles.");
+    } finally {
+      setRafflesLoading(false);
+    }
+  }, [mode, raffleQueryDebounced]);
+
+  useEffect(() => {
+    loadRaffles();
+  }, [loadRaffles]);
+
+  // When mode changes, clear irrelevant targeting inputs
+  useEffect(() => {
+    setErrorMsg(null);
+    setStatusMsg(null);
+
+    if (mode !== "selected_customers") {
+      setSelectedCustomerIds([]);
+      setManualCustomerIds("");
+      setCustomerQuery("");
+      setCustomerQueryDebounced("");
+      setCustomers([]);
+    }
+
+    if (mode !== "multi_raffle_union") {
+      setRaffleIdsMulti("");
+    }
+
+    // raffleId is used by raffle_users AND attempt_status (optional in attempt_status)
+    if (mode === "all_users" || mode === "selected_customers") {
+      setRaffleId("");
+      setRaffleQuery("");
+      setRaffleQueryDebounced("");
+      setRaffles([]);
+    }
+  }, [mode]);
 
   const toggleSelectedCustomer = useCallback((id: string) => {
     setSelectedCustomerIds((prev) => {
@@ -149,6 +337,18 @@ export default function AdminSendNotificationPage() {
     effectiveSelectedCustomerIds.length,
   ]);
 
+  const selectRaffle = useCallback((r: RafflePick) => {
+    setRaffleId(r.id);
+    setRaffleQuery(r.item_name);
+  }, []);
+
+  const clearRaffleSelection = useCallback(() => {
+    setRaffleId("");
+    setRaffleQuery("");
+    setRaffleQueryDebounced("");
+    setRaffles([]);
+  }, []);
+
   const sendCampaign = useCallback(async () => {
     setStatusMsg(null);
     setErrorMsg(null);
@@ -161,6 +361,14 @@ export default function AdminSendNotificationPage() {
     let parsedData: Record<string, unknown> = {};
     try {
       parsedData = dataJson.trim() ? JSON.parse(dataJson) : {};
+      if (
+        parsedData == null ||
+        typeof parsedData !== "object" ||
+        Array.isArray(parsedData)
+      ) {
+        setErrorMsg('data JSON must be an object (e.g. {"source":"admin"}).');
+        return;
+      }
     } catch {
       setErrorMsg("data JSON is invalid.");
       return;
@@ -169,9 +377,6 @@ export default function AdminSendNotificationPage() {
     setLoading(true);
     try {
       // Build payload to match the Edge Function contract
-      // IMPORTANT: selected_customers must send:
-      //   mode: "selected_customers"
-      //   customer_ids: [cid, ...]
       const payload: Record<string, unknown> = {
         mode,
         title: title.trim() || "SnapWin",
@@ -197,9 +402,6 @@ export default function AdminSendNotificationPage() {
 
       if (mode === "selected_customers") {
         payload.customer_ids = effectiveSelectedCustomerIds;
-        // Optional: if your Edge Function supports it, you can also pass:
-        // payload.send_mode = "selected_customers";
-        // But "mode" already communicates that.
       }
 
       const { data, error } = await supabase.functions.invoke(
@@ -235,6 +437,8 @@ export default function AdminSendNotificationPage() {
     parsedMultiRaffleIds,
     effectiveSelectedCustomerIds,
   ]);
+
+  const showRafflePicker = mode === "raffle_users" || mode === "attempt_status";
 
   return (
     <div className="space-y-6">
@@ -278,9 +482,7 @@ export default function AdminSendNotificationPage() {
               }}
             >
               <option value="all_users">Send to all app users</option>
-              <option value="raffle_users">
-                Send to all users in raffle X
-              </option>
+              <option value="raffle_users">Send to all users in raffle</option>
               <option value="selected_customers">
                 Send to selected customers
               </option>
@@ -310,76 +512,171 @@ export default function AdminSendNotificationPage() {
             </div>
           </div>
 
+          {/* Raffle targeting (replaces manual ID entry with search + pick) */}
           <div className="space-y-2">
-            <label
-              className="text-sm font-medium"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Raffle ID (used by raffle / attempts modes)
-            </label>
-            <input
-              value={raffleId}
-              onChange={(e) => setRaffleId(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-              placeholder="uuid"
-            />
+            {showRafflePicker ? (
+              <>
+                <div className="flex items-center justify-between">
+                  <label
+                    className="text-sm font-medium"
+                    style={{ color: COLORS.textSecondary }}
+                  >
+                    Raffle (search and select)
+                  </label>
 
-            {mode === "attempt_status" ? (
-              <div className="flex gap-2 mt-2">
-                <select
-                  value={attemptPassed}
-                  onChange={(e) =>
-                    setAttemptPassed(e.target.value as "passed" | "failed")
+                  {raffleId ? (
+                    <button
+                      type="button"
+                      onClick={clearRaffleSelection}
+                      className="text-xs underline"
+                      style={{ color: COLORS.textMuted }}
+                    >
+                      Clear
+                    </button>
+                  ) : null}
+                </div>
+
+                <SearchSelect
+                  label=""
+                  placeholder="Search current raffles by name…"
+                  query={raffleQuery}
+                  setQuery={setRaffleQuery}
+                  loading={rafflesLoading}
+                  emptyHint={
+                    mode === "attempt_status"
+                      ? "Optional: select a raffle to scope attempts. Leave blank for all raffles."
+                      : "Type to search current raffles…"
                   }
-                  className="border rounded px-3 py-2 text-sm"
-                  style={{
-                    borderColor: COLORS.inputBorder,
-                    backgroundColor: COLORS.inputBg,
-                    color: COLORS.textPrimary,
-                  }}
-                >
-                  <option value="passed">Attempts passed</option>
-                  <option value="failed">Attempts failed</option>
-                </select>
-                <div
-                  className="text-xs self-center"
-                  style={{ color: COLORS.textMuted }}
-                >
-                  Raffle ID optional here (blank = across all raffles)
-                </div>
-              </div>
-            ) : null}
-
-            {mode === "multi_raffle_union" ? (
-              <div className="space-y-2 mt-2">
-                <label
-                  className="text-sm font-medium"
-                  style={{ color: COLORS.textSecondary }}
-                >
-                  Raffle IDs (2+), comma or new line
-                </label>
-                <textarea
-                  value={raffleIdsMulti}
-                  onChange={(e) => setRaffleIdsMulti(e.target.value)}
-                  className="w-full border rounded px-3 py-2 text-sm"
-                  style={{
-                    borderColor: COLORS.inputBorder,
-                    backgroundColor: COLORS.inputBg,
-                    color: COLORS.textPrimary,
-                    minHeight: 90,
-                  }}
-                  placeholder="uuid1&#10;uuid2&#10;uuid3"
+                  results={
+                    raffles.length ? (
+                      <div
+                        className="divide-y"
+                        style={{ borderColor: COLORS.cardBorder }}
+                      >
+                        {raffles.map((r) => {
+                          const active = raffleId === r.id;
+                          return (
+                            <button
+                              key={r.id}
+                              type="button"
+                              onClick={() => selectRaffle(r)}
+                              className="w-full text-left px-3 py-2 text-sm"
+                              style={{
+                                backgroundColor: active
+                                  ? COLORS.highlightCardBg
+                                  : COLORS.cardBg,
+                                color: COLORS.textPrimary,
+                              }}
+                            >
+                              <div className="font-medium">{r.item_name}</div>
+                              <div
+                                className="text-xs"
+                                style={{ color: COLORS.textMuted }}
+                              >
+                                {r.status.toUpperCase()} · Draw:{" "}
+                                {formatDateMaybe(r.draw_date)} · ID:{" "}
+                                {formatShortId(r.id)}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ) : null
+                  }
                 />
-                <div className="text-xs" style={{ color: COLORS.textMuted }}>
-                  Parsed: {parsedMultiRaffleIds.length} raffle IDs
+
+                {/* Keep the actual raffleId visible for debugging/copy, but not required to type */}
+                <div
+                  className="rounded-lg border px-3 py-2 text-xs"
+                  style={{
+                    borderColor: COLORS.cardBorder,
+                    backgroundColor: COLORS.highlightCardBg,
+                    color: COLORS.textSecondary,
+                  }}
+                >
+                  Selected raffle ID:{" "}
+                  <span style={{ color: COLORS.textPrimary, fontWeight: 600 }}>
+                    {raffleId || "—"}
+                  </span>
+                  {mode === "attempt_status" ? (
+                    <span style={{ color: COLORS.textMuted }}>
+                      {" "}
+                      (optional for attempt_status)
+                    </span>
+                  ) : null}
                 </div>
-              </div>
-            ) : null}
+
+                {mode === "attempt_status" ? (
+                  <div className="flex gap-2 mt-2">
+                    <select
+                      value={attemptPassed}
+                      onChange={(e) =>
+                        setAttemptPassed(e.target.value as "passed" | "failed")
+                      }
+                      className="border rounded px-3 py-2 text-sm"
+                      style={{
+                        borderColor: COLORS.inputBorder,
+                        backgroundColor: COLORS.inputBg,
+                        color: COLORS.textPrimary,
+                      }}
+                    >
+                      <option value="passed">Attempts passed</option>
+                      <option value="failed">Attempts failed</option>
+                    </select>
+                    <div
+                      className="text-xs self-center"
+                      style={{ color: COLORS.textMuted }}
+                    >
+                      Leaving raffle blank targets across all raffles.
+                    </div>
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <>
+                {/* Multi raffle union stays as-is (it is inherently multi-ID), but we polish the copy */}
+                {mode === "multi_raffle_union" ? (
+                  <div className="space-y-2">
+                    <label
+                      className="text-sm font-medium"
+                      style={{ color: COLORS.textSecondary }}
+                    >
+                      Raffle IDs (2+), comma or new line
+                    </label>
+                    <textarea
+                      value={raffleIdsMulti}
+                      onChange={(e) => setRaffleIdsMulti(e.target.value)}
+                      className="w-full border rounded px-3 py-2 text-sm"
+                      style={{
+                        borderColor: COLORS.inputBorder,
+                        backgroundColor: COLORS.inputBg,
+                        color: COLORS.textPrimary,
+                        minHeight: 90,
+                      }}
+                      placeholder="uuid1&#10;uuid2&#10;uuid3"
+                    />
+                    <div
+                      className="text-xs"
+                      style={{ color: COLORS.textMuted }}
+                    >
+                      Parsed: {parsedMultiRaffleIds.length} raffle IDs
+                    </div>
+                  </div>
+                ) : (
+                  <div
+                    className="rounded-xl border p-3 text-sm"
+                    style={{
+                      borderColor: COLORS.cardBorder,
+                      backgroundColor: COLORS.highlightCardBg,
+                      color: COLORS.textSecondary,
+                    }}
+                  >
+                    Raffle selection appears for “raffle users” and “attempt
+                    status” modes.
+                  </div>
+                )}
+              </>
+            )}
           </div>
         </div>
 
@@ -428,11 +725,13 @@ export default function AdminSendNotificationPage() {
                           key={c.id}
                           className="flex items-center gap-3 px-3 py-2 text-sm cursor-pointer"
                           style={{ color: COLORS.textPrimary }}
+                          onClick={(e) => stopPropagation(e)}
                         >
                           <input
                             type="checkbox"
                             checked={checked}
                             onChange={() => toggleSelectedCustomer(c.id)}
+                            onClick={(e) => stopPropagation(e)}
                           />
                           <div className="flex-1">
                             <div className="font-medium">
@@ -445,7 +744,8 @@ export default function AdminSendNotificationPage() {
                               className="text-xs"
                               style={{ color: COLORS.textMuted }}
                             >
-                              Push token: {c.expo_push_token ? "Yes" : "No"}
+                              Push token: {c.expo_push_token ? "Yes" : "No"} ·
+                              ID: {formatShortId(c.id)}
                             </div>
                           </div>
                         </label>

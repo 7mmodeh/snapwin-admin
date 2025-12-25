@@ -37,6 +37,28 @@ function escapeIlike(input: string) {
   return input.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
 }
 
+function formatCell(v: unknown): string {
+  if (v == null) return "—";
+  if (typeof v === "string") {
+    // attempt to format timestamp-ish strings
+    const looksLikeDate =
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(v) ||
+      /^\d{4}-\d{2}-\d{2}/.test(v);
+    if (looksLikeDate) {
+      const d = new Date(v);
+      if (!Number.isNaN(d.getTime())) return d.toLocaleString("en-IE");
+    }
+    return v;
+  }
+  if (typeof v === "number") return Number.isFinite(v) ? String(v) : "—";
+  if (typeof v === "boolean") return v ? "true" : "false";
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
 const DATASETS: Record<
   DatasetKey,
   {
@@ -185,6 +207,9 @@ export default function ReportsPage() {
   const [err, setErr] = useState<string | null>(null);
   const [rows, setRows] = useState<ReportRow[]>([]);
 
+  // Table search (client-side over loaded rows)
+  const [tableSearch, setTableSearch] = useState("");
+
   const ds = DATASETS[dataset];
 
   const onDatasetChange = useCallback((next: DatasetKey) => {
@@ -192,6 +217,7 @@ export default function ReportsPage() {
     setSelectedCols(DATASETS[next].defaults);
     setRows([]);
     setErr(null);
+    setTableSearch("");
   }, []);
 
   const toggleCol = useCallback((c: string) => {
@@ -285,8 +311,6 @@ export default function ReportsPage() {
       const { data, error } = await q;
       if (error) throw error;
 
-      // This avoids the “GenericStringError[] -> Record<string, unknown>[]” warning
-      // by narrowing safely at runtime and typing the state explicitly.
       const list = Array.isArray(data) ? (data as unknown[]) : [];
       const normalized: ReportRow[] = list
         .filter(
@@ -327,6 +351,19 @@ export default function ReportsPage() {
     const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
     return `${dataset}_report_${stamp}.csv`;
   }, [dataset]);
+
+  const filteredRows = useMemo(() => {
+    const s = tableSearch.trim().toLowerCase();
+    if (!s) return rows;
+
+    return rows.filter((r) => {
+      for (const c of selectedCols) {
+        const txt = formatCell(r[c]).toLowerCase();
+        if (txt.includes(s)) return true;
+      }
+      return false;
+    });
+  }, [rows, tableSearch, selectedCols]);
 
   return (
     <div className="space-y-6">
@@ -376,6 +413,7 @@ export default function ReportsPage() {
         </div>
       </div>
 
+      {/* Filters + Column selection */}
       <div
         className="rounded-2xl p-5 border space-y-4"
         style={{
@@ -823,6 +861,123 @@ export default function ReportsPage() {
           </span>{" "}
           (max 5000 per run)
         </div>
+      </div>
+
+      {/* Render table results */}
+      <div
+        className="rounded-2xl border overflow-hidden"
+        style={{
+          backgroundColor: COLORS.cardBg,
+          borderColor: COLORS.cardBorder,
+          boxShadow: `0 18px 40px ${COLORS.cardShadow}`,
+        }}
+      >
+        <div
+          className="px-4 py-3 border-b flex flex-col md:flex-row md:items-center md:justify-between gap-2"
+          style={{ borderColor: COLORS.cardBorder }}
+        >
+          <div
+            className="text-sm font-semibold"
+            style={{ color: COLORS.textPrimary }}
+          >
+            Results
+          </div>
+
+          <div className="flex gap-2 items-center">
+            <input
+              value={tableSearch}
+              onChange={(e) => setTableSearch(e.target.value)}
+              placeholder="Search in loaded rows…"
+              className="rounded-full px-4 py-2 text-sm border focus:outline-none focus:ring-2"
+              style={{
+                borderColor: COLORS.inputBorder,
+                backgroundColor: COLORS.inputBg,
+                color: COLORS.textPrimary,
+                minWidth: 240,
+              }}
+            />
+            <div className="text-xs" style={{ color: COLORS.textSecondary }}>
+              Showing{" "}
+              <strong style={{ color: COLORS.textPrimary }}>
+                {filteredRows.length}
+              </strong>{" "}
+              {tableSearch.trim() ? (
+                <span style={{ color: COLORS.textMuted }}>
+                  (filtered from {rows.length})
+                </span>
+              ) : null}
+            </div>
+          </div>
+        </div>
+
+        {rows.length === 0 ? (
+          <div className="p-8 text-center space-y-2">
+            <div
+              className="text-sm font-medium"
+              style={{ color: COLORS.textPrimary }}
+            >
+              No results yet
+            </div>
+            <div className="text-xs" style={{ color: COLORS.textSecondary }}>
+              Run a report to generate a table preview here.
+            </div>
+          </div>
+        ) : filteredRows.length === 0 ? (
+          <div className="p-8 text-center space-y-2">
+            <div
+              className="text-sm font-medium"
+              style={{ color: COLORS.textPrimary }}
+            >
+              No matching rows
+            </div>
+            <div className="text-xs" style={{ color: COLORS.textSecondary }}>
+              Try clearing the search box.
+            </div>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-xs">
+              <thead
+                style={{
+                  backgroundColor: COLORS.highlightCardBg,
+                  color: COLORS.textSecondary,
+                }}
+              >
+                <tr>
+                  {selectedCols.map((c) => (
+                    <th
+                      key={c}
+                      className="px-3 py-2 text-left uppercase tracking-wide font-semibold"
+                      style={{ fontSize: "0.7rem" }}
+                    >
+                      {c}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {filteredRows.map((r, idx) => (
+                  <tr
+                    key={idx}
+                    className="border-t"
+                    style={{
+                      borderColor: COLORS.cardBorder,
+                      backgroundColor: idx % 2 ? "#FAFAF9" : COLORS.cardBg,
+                    }}
+                  >
+                    {selectedCols.map((c) => (
+                      <td key={c} className="px-3 py-2 align-top">
+                        <span style={{ color: COLORS.textPrimary }}>
+                          {formatCell(r[c])}
+                        </span>
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
     </div>
   );
