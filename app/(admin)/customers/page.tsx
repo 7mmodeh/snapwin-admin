@@ -199,10 +199,22 @@ function CopyButton({
   );
 }
 
+function getParamId(params: unknown): string | null {
+  if (!params || typeof params !== "object") return null;
+  const v = (params as Record<string, unknown>).id;
+
+  if (typeof v === "string" && v.trim()) return v.trim();
+  if (Array.isArray(v) && typeof v[0] === "string" && v[0].trim())
+    return v[0].trim();
+
+  return null;
+}
+
 export default function CustomerDetailPage() {
-  const params = useParams<{ id: string }>();
+  const params = useParams();
   const router = useRouter();
-  const customerId = params.id;
+
+  const customerId = useMemo(() => getParamId(params), [params]);
 
   const [customer, setCustomer] = useState<CustomerDetail | null>(null);
   const [tickets, setTickets] = useState<CustomerTicket[]>([]);
@@ -210,14 +222,22 @@ export default function CustomerDetailPage() {
   const [error, setError] = useState<string | null>(null);
 
   const rtTimerRef = useRef<number | null>(null);
+  const channelRef = useRef<RealtimeChannel | null>(null);
 
   const fetchDetail = useCallback(async () => {
+    setError(null);
+
+    if (!customerId) {
+      // Critical: do not leave the page in a permanent "loading" state
+      setCustomer(null);
+      setTickets([]);
+      setLoading(false);
+      setError("Missing customer ID in route.");
+      return;
+    }
+
+    setLoading(true);
     try {
-      if (!customerId) return;
-
-      setLoading(true);
-      setError(null);
-
       const [customerRes, ticketsRes] = await Promise.all([
         supabase
           .from("customers")
@@ -247,12 +267,14 @@ export default function CustomerDetailPage() {
       ]);
 
       if (customerRes.error) throw customerRes.error;
+
       if (!customerRes.data) {
         setCustomer(null);
         setTickets([]);
         setError("Customer not found.");
         return;
       }
+
       if (ticketsRes.error) throw ticketsRes.error;
 
       const custNorm = normalizeCustomer(
@@ -297,6 +319,12 @@ export default function CustomerDetailPage() {
   }, [fetchDetail]);
 
   useEffect(() => {
+    // Clean any previous subscription
+    if (channelRef.current) {
+      supabase.removeChannel(channelRef.current);
+      channelRef.current = null;
+    }
+
     if (!customerId) return;
 
     const scheduleRefresh = () => {
@@ -320,9 +348,14 @@ export default function CustomerDetailPage() {
       )
       .subscribe();
 
+    channelRef.current = channel;
+
     return () => {
       if (rtTimerRef.current) window.clearTimeout(rtTimerRef.current);
-      supabase.removeChannel(channel);
+      if (channelRef.current) {
+        supabase.removeChannel(channelRef.current);
+        channelRef.current = null;
+      }
     };
   }, [customerId, fetchDetail]);
 
@@ -416,13 +449,18 @@ export default function CustomerDetailPage() {
     URL.revokeObjectURL(url);
   };
 
-  const goTicket = (ticketId: string) => router.push(`/tickets/${ticketId}`);
+  // IMPORTANT: your admin routes live under /(admin)
+  const goTicket = (ticketId: string) =>
+    router.push(`/customers/${customerId}/tickets/${ticketId}`); // fallback if you have nested
+  // If you already have /(admin)/tickets/[id], use:
+  // const goTicket = (ticketId: string) => router.push(`/tickets/${ticketId}`);
+
   const goRaffle = (raffleId: string) => router.push(`/raffles/${raffleId}`);
 
   if (loading) {
     return (
       <div
-        className="flex items-center justify-center h-full"
+        className="flex items-center justify-center min-h-[40vh]"
         style={{ color: COLORS.textSecondary }}
       >
         Loading customer...
@@ -451,7 +489,22 @@ export default function CustomerDetailPage() {
     );
   }
 
-  if (!customer) return null;
+  if (!customer) {
+    // Never return null; show something
+    return (
+      <div className="space-y-3">
+        <button
+          type="button"
+          onClick={() => router.back()}
+          className="text-sm underline"
+          style={{ color: COLORS.primary }}
+        >
+          ← Back
+        </button>
+        <div style={{ color: COLORS.textSecondary }}>No customer loaded.</div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
