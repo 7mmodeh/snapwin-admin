@@ -162,8 +162,6 @@ export default function AdminTicketsPage() {
             payment_error,
             is_winner,
             created_at,
-
-            -- ✅ IMPORTANT: pin the FK relationship explicitly to avoid ambiguity
             raffle:raffles!tickets_raffle_id_fkey ( id, item_name ),
             customer:customers!tickets_customer_id_fkey ( id, email )
           `,
