@@ -408,6 +408,10 @@ export default function AdminSendNotificationPage() {
         "admin-send-notification",
         {
           body: payload,
+          headers: {
+            "x-admin-secret":
+              process.env.NEXT_PUBLIC_ADMIN_FUNCTION_SECRET || "",
+          },
         }
       );
 
