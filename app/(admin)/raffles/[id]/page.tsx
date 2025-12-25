@@ -14,6 +14,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 
 const BUCKET_NAME = "raffle-images";
 
@@ -27,21 +28,23 @@ type RaffleDetail = {
   ticket_price: number | string;
   draw_date: string | null;
   winner_id: string | null;
-  winning_ticket_id: string | null; // ✅ NEW (audit)
-  winning_ticket_number: number | null; // ✅ NEW (audit)
+  winning_ticket_id: string | null; // ✅ audit
+  winning_ticket_number: number | null; // ✅ audit
   item_image_url: string | null;
   created_at: string;
   updated_at: string | null;
-  max_tickets_per_customer: number; // ✅ NEW
+  max_tickets_per_customer: number; // ✅
 };
 
 type TicketRow = {
   id: string;
+  ticket_code: string | null; // ✅ migration-safe
   ticket_number: number;
   customer_id: string;
   payment_status: "pending" | "completed" | "failed";
   is_winner: boolean;
   purchased_at: string | null;
+  created_at: string | null;
   payment_amount: string | number | null;
 };
 
@@ -53,18 +56,40 @@ type WinnerCustomer = {
   county: string | null;
 };
 
-const STATUS_OPTIONS: Array<RaffleDetail["status"]> = [
-  "active",
-  "soldout",
-  "drawn",
-  "cancelled",
-];
+type DrawWinnerRpcResult = {
+  winner_id: string | null;
+  winning_ticket_id: string | null;
+  winning_ticket_number: number | null;
+};
+
+const RAFFLE_SELECT =
+  "id, item_name, item_description, status, total_tickets, sold_tickets, ticket_price, draw_date, winner_id, winning_ticket_id, winning_ticket_number, item_image_url, created_at, updated_at, max_tickets_per_customer";
+
+const TICKETS_SELECT =
+  "id, ticket_code, ticket_number, customer_id, payment_status, is_winner, purchased_at, created_at, payment_amount";
+
+function isDrawWinnerRpcResult(v: unknown): v is DrawWinnerRpcResult {
+  if (typeof v !== "object" || v === null) return false;
+  const o = v as Record<string, unknown>;
+  const okWinner =
+    o.winner_id === null ||
+    typeof o.winner_id === "string" ||
+    o.winner_id === undefined;
+  const okTicketId =
+    o.winning_ticket_id === null ||
+    typeof o.winning_ticket_id === "string" ||
+    o.winning_ticket_id === undefined;
+  const okTicketNum =
+    o.winning_ticket_number === null ||
+    typeof o.winning_ticket_number === "number" ||
+    o.winning_ticket_number === undefined;
+  return okWinner && okTicketId && okTicketNum;
+}
 
 export default function RaffleDetailPage() {
   const params = useParams();
   const router = useRouter();
 
-  // Normalize id
   const rawId = (params as { id?: string | string[] }).id;
   const raffleId = Array.isArray(rawId) ? rawId[0] : rawId;
 
@@ -74,11 +99,10 @@ export default function RaffleDetailPage() {
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [drawing, setDrawing] = useState(false); // ✅ NEW
+  const [drawing, setDrawing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
-  // Editable drafts
   const [itemNameDraft, setItemNameDraft] = useState("");
   const [itemDescriptionDraft, setItemDescriptionDraft] = useState("");
   const [ticketPriceDraft, setTicketPriceDraft] = useState("");
@@ -87,21 +111,18 @@ export default function RaffleDetailPage() {
     useState<RaffleDetail["status"]>("active");
   const [drawDateDraft, setDrawDateDraft] = useState<string>("");
   const [maxTicketsPerCustomerDraft, setMaxTicketsPerCustomerDraft] =
-    useState<string>("3"); // ✅ NEW
+    useState<string>("3");
 
-  // Image replace state
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const [imageSaving, setImageSaving] = useState(false);
 
-  // Prevent object URL memory leaks
   useEffect(() => {
     return () => {
       if (imagePreview) URL.revokeObjectURL(imagePreview);
     };
   }, [imagePreview]);
 
-  // ✅ Realtime: debounce refresh to avoid refetch storms
   const realtimeRefreshTimerRef = useRef<number | null>(null);
   const scheduleRefresh = useCallback(() => {
     if (realtimeRefreshTimerRef.current) {
@@ -123,18 +144,14 @@ export default function RaffleDetailPage() {
       const [raffleRes, ticketsRes] = await Promise.all([
         supabase
           .from("raffles")
-          .select(
-            "id, item_name, item_description, status, total_tickets, sold_tickets, ticket_price, draw_date, winner_id, winning_ticket_id, winning_ticket_number, item_image_url, created_at, updated_at, max_tickets_per_customer"
-          )
+          .select(RAFFLE_SELECT)
           .eq("id", raffleId)
           .maybeSingle<RaffleDetail>(),
         supabase
           .from("tickets")
-          .select(
-            "id, ticket_number, customer_id, payment_status, is_winner, purchased_at, payment_amount"
-          )
+          .select<string, TicketRow>(TICKETS_SELECT)
           .eq("raffle_id", raffleId)
-          .order("ticket_number", { ascending: true }),
+          .order("created_at", { ascending: true }),
       ]);
 
       if (raffleRes.error) throw raffleRes.error;
@@ -146,12 +163,11 @@ export default function RaffleDetailPage() {
       if (ticketsRes.error) throw ticketsRes.error;
 
       const raffleData = raffleRes.data;
-      const ticketsData = (ticketsRes.data ?? []) as TicketRow[];
+      const ticketsData = ticketsRes.data ?? [];
 
       setRaffle(raffleData);
       setTickets(ticketsData);
 
-      // init drafts
       setItemNameDraft(raffleData.item_name);
       setItemDescriptionDraft(raffleData.item_description);
 
@@ -167,12 +183,10 @@ export default function RaffleDetailPage() {
         raffleData.draw_date ? toDateTimeLocalValue(raffleData.draw_date) : ""
       );
 
-      // ✅ NEW
       setMaxTicketsPerCustomerDraft(
         String(raffleData.max_tickets_per_customer ?? 3)
       );
 
-      // load winner details if any
       if (raffleData.winner_id) {
         const winnerRes = await supabase
           .from("customers")
@@ -180,21 +194,16 @@ export default function RaffleDetailPage() {
           .eq("id", raffleData.winner_id)
           .maybeSingle<WinnerCustomer>();
 
-        if (!winnerRes.error && winnerRes.data) {
-          setWinner(winnerRes.data);
-        } else {
-          setWinner(null);
-        }
+        if (!winnerRes.error && winnerRes.data) setWinner(winnerRes.data);
+        else setWinner(null);
       } else {
         setWinner(null);
       }
     } catch (err: unknown) {
       console.error("Error loading raffle detail:", err);
-      if (err instanceof Error) {
-        setError(err.message);
-      } else {
-        setError("Failed to load raffle details.");
-      }
+      setError(
+        err instanceof Error ? err.message : "Failed to load raffle details."
+      );
     } finally {
       setLoading(false);
     }
@@ -204,11 +213,9 @@ export default function RaffleDetailPage() {
     fetchDetail();
   }, [fetchDetail]);
 
-  // ✅ NEW: Realtime subscriptions (raffles + tickets)
   useEffect(() => {
     if (!raffleId) return;
 
-    // Ensure any pending scheduled refresh is cleared on cleanup
     const clearTimer = () => {
       if (realtimeRefreshTimerRef.current) {
         window.clearTimeout(realtimeRefreshTimerRef.current);
@@ -216,8 +223,7 @@ export default function RaffleDetailPage() {
       }
     };
 
-    // Subscribe to changes in tickets for this raffle
-    const ticketsChannel = supabase
+    const ticketsChannel: RealtimeChannel = supabase
       .channel(`admin-raffle-${raffleId}-tickets`)
       .on(
         "postgres_changes",
@@ -227,15 +233,11 @@ export default function RaffleDetailPage() {
           table: "tickets",
           filter: `raffle_id=eq.${raffleId}`,
         },
-        () => {
-          // ticket insert/update (purchase, payment_status change, is_winner flip)
-          scheduleRefresh();
-        }
+        () => scheduleRefresh()
       )
       .subscribe();
 
-    // Subscribe to changes in raffles for this raffle
-    const rafflesChannel = supabase
+    const rafflesChannel: RealtimeChannel = supabase
       .channel(`admin-raffle-${raffleId}-raffles`)
       .on(
         "postgres_changes",
@@ -245,10 +247,7 @@ export default function RaffleDetailPage() {
           table: "raffles",
           filter: `id=eq.${raffleId}`,
         },
-        () => {
-          // raffle updated (sold_tickets recompute, status change, draw audit written)
-          scheduleRefresh();
-        }
+        () => scheduleRefresh()
       )
       .subscribe();
 
@@ -332,7 +331,6 @@ export default function RaffleDetailPage() {
       return;
     }
 
-    // ensure total_tickets is not less than sold_tickets
     if (!Number.isNaN(totalTicketsNumber)) {
       const sold = raffle.sold_tickets ?? 0;
       if (totalTicketsNumber < sold) {
@@ -353,25 +351,19 @@ export default function RaffleDetailPage() {
         total_tickets?: number;
         status: RaffleDetail["status"];
         draw_date: string | null;
-        max_tickets_per_customer: number; // ✅ NEW (required in payload)
+        max_tickets_per_customer: number;
       } = {
         status: statusDraft,
         draw_date: drawDateDraft ? new Date(drawDateDraft).toISOString() : null,
         max_tickets_per_customer: maxPerCustomerNumber,
       };
 
-      if (itemNameDraft.trim()) {
-        updatePayload.item_name = itemNameDraft.trim();
-      }
-      if (itemDescriptionDraft.trim()) {
+      if (itemNameDraft.trim()) updatePayload.item_name = itemNameDraft.trim();
+      if (itemDescriptionDraft.trim())
         updatePayload.item_description = itemDescriptionDraft.trim();
-      }
-      if (!Number.isNaN(priceNumber)) {
-        updatePayload.ticket_price = priceNumber;
-      }
-      if (!Number.isNaN(totalTicketsNumber)) {
+      if (!Number.isNaN(priceNumber)) updatePayload.ticket_price = priceNumber;
+      if (!Number.isNaN(totalTicketsNumber))
         updatePayload.total_tickets = totalTicketsNumber;
-      }
 
       const { error: updateError } = await supabase
         .from("raffles")
@@ -400,17 +392,12 @@ export default function RaffleDetailPage() {
       setSuccess("Raffle updated successfully.");
     } catch (err: unknown) {
       console.error("Error updating raffle:", err);
-      if (err instanceof Error) {
-        setError(err.message);
-      } else {
-        setError("Failed to update raffle.");
-      }
+      setError(err instanceof Error ? err.message : "Failed to update raffle.");
     } finally {
       setSaving(false);
     }
   };
 
-  // ✅ NEW: draw action (calls hardened RPC)
   const handleDrawWinner = async () => {
     if (!raffleId || !raffle) return;
 
@@ -419,31 +406,30 @@ export default function RaffleDetailPage() {
       setError(null);
       setSuccess(null);
 
-      const { data, error: rpcError } = await supabase.rpc(
-        "draw_raffle_winner",
-        { p_raffle_id: raffleId }
-      );
+      const rpcRes = await supabase.rpc("draw_raffle_winner", {
+        p_raffle_id: raffleId,
+      });
 
-      if (rpcError) throw rpcError;
+      if (rpcRes.error) throw rpcRes.error;
 
-      // Supabase RPC may return an array (set-returning) or object depending on your function signature.
-      const row =
-        Array.isArray(data) && data.length
-          ? data[0]
-          : !Array.isArray(data)
-          ? data
-          : null;
+      const raw: unknown = rpcRes.data;
 
-      if (!row) {
-        throw new Error("Draw completed but returned no data.");
+      const parsed: DrawWinnerRpcResult | null = Array.isArray(raw)
+        ? raw.length && isDrawWinnerRpcResult(raw[0])
+          ? raw[0]
+          : null
+        : isDrawWinnerRpcResult(raw)
+        ? raw
+        : null;
+
+      if (!parsed) {
+        throw new Error("Draw completed but returned an unexpected payload.");
       }
 
-      const nextWinnerId: string | null = row.winner_id ?? null;
-      const nextWinningTicketId: string | null = row.winning_ticket_id ?? null;
-      const nextWinningTicketNumber: number | null =
-        row.winning_ticket_number ?? null;
+      const nextWinnerId = parsed.winner_id ?? null;
+      const nextWinningTicketId = parsed.winning_ticket_id ?? null;
+      const nextWinningTicketNumber = parsed.winning_ticket_number ?? null;
 
-      // Update local raffle state immediately for UX
       setRaffle((prev) =>
         prev
           ? {
@@ -458,7 +444,6 @@ export default function RaffleDetailPage() {
           : prev
       );
 
-      // Fetch winner details (if any)
       if (nextWinnerId) {
         const winnerRes = await supabase
           .from("customers")
@@ -466,26 +451,20 @@ export default function RaffleDetailPage() {
           .eq("id", nextWinnerId)
           .maybeSingle<WinnerCustomer>();
 
-        if (!winnerRes.error && winnerRes.data) {
-          setWinner(winnerRes.data);
-        } else {
-          setWinner(null);
-        }
+        if (!winnerRes.error && winnerRes.data) setWinner(winnerRes.data);
+        else setWinner(null);
       } else {
         setWinner(null);
       }
 
-      // Refresh tickets so is_winner reflects trigger updates
       const ticketsRes = await supabase
         .from("tickets")
-        .select(
-          "id, ticket_number, customer_id, payment_status, is_winner, purchased_at, payment_amount"
-        )
+        .select<string, TicketRow>(TICKETS_SELECT)
         .eq("raffle_id", raffleId)
-        .order("ticket_number", { ascending: true });
+        .order("created_at", { ascending: true });
 
       if (ticketsRes.error) throw ticketsRes.error;
-      setTickets((ticketsRes.data ?? []) as TicketRow[]);
+      setTickets(ticketsRes.data ?? []);
 
       setSuccess(
         nextWinningTicketNumber != null
@@ -494,34 +473,23 @@ export default function RaffleDetailPage() {
       );
     } catch (err: unknown) {
       console.error("Error drawing winner:", err);
-      if (err instanceof Error) {
-        setError(err.message);
-      } else {
-        setError("Failed to draw winner.");
-      }
+      setError(err instanceof Error ? err.message : "Failed to draw winner.");
     } finally {
       setDrawing(false);
     }
   };
 
-  // image file selection
   const handleImageChange = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null;
 
-    // Revoke old preview before creating a new one
     if (imagePreview) URL.revokeObjectURL(imagePreview);
 
     setImageFile(file);
 
-    if (file) {
-      const url = URL.createObjectURL(file);
-      setImagePreview(url);
-    } else {
-      setImagePreview(null);
-    }
+    if (file) setImagePreview(URL.createObjectURL(file));
+    else setImagePreview(null);
   };
 
-  // upload new image and update raffle.item_image_url
   const handleImageUpload = async () => {
     if (!raffle || !imageFile) return;
 
@@ -570,34 +538,35 @@ export default function RaffleDetailPage() {
       setSuccess("Raffle image updated successfully.");
     } catch (err: unknown) {
       console.error("Error uploading new image:", err);
-      if (err instanceof Error) {
-        setError(err.message);
-      } else {
-        setError("Failed to upload new image.");
-      }
+      setError(
+        err instanceof Error ? err.message : "Failed to upload new image."
+      );
     } finally {
       setImageSaving(false);
     }
   };
 
-  // Export tickets CSV
   const handleExportTickets = () => {
     if (!tickets.length || !raffle) return;
 
     const header = [
+      "ticket_code",
       "ticket_number",
       "payment_status",
       "is_winner",
       "purchased_at",
+      "created_at",
       "payment_amount",
       "customer_id",
     ];
 
     const rows = tickets.map((t) => [
+      t.ticket_code ?? "",
       t.ticket_number,
       t.payment_status,
       t.is_winner ? "true" : "false",
       t.purchased_at ? new Date(t.purchased_at).toISOString() : "",
+      t.created_at ? new Date(t.created_at).toISOString() : "",
       t.payment_amount ?? "",
       t.customer_id,
     ]);
@@ -669,16 +638,13 @@ export default function RaffleDetailPage() {
   if (!raffle) return null;
 
   const currentImageSrc = raffle.item_image_url || "/vercel.svg";
-
   const canDraw =
     raffle.status === "soldout" &&
     (raffle.sold_tickets ?? 0) >= raffle.total_tickets;
-
   const alreadyDrawn = raffle.status === "drawn";
 
   return (
     <div className="space-y-6">
-      {/* Top header */}
       <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
         <div>
           <button
@@ -699,7 +665,6 @@ export default function RaffleDetailPage() {
             {raffle.item_description}
           </p>
 
-          {/* ✅ NEW: Show max per customer in header area */}
           <p className="text-xs mt-2" style={{ color: COLORS.textMuted }}>
             Max tickets per customer:{" "}
             <span style={{ color: COLORS.textSecondary, fontWeight: 700 }}>
@@ -707,7 +672,6 @@ export default function RaffleDetailPage() {
             </span>
           </p>
 
-          {/* ✅ NEW: Show winning ticket audit details if drawn */}
           {alreadyDrawn && (
             <p className="text-xs mt-2" style={{ color: COLORS.textMuted }}>
               Winning ticket:{" "}
@@ -752,7 +716,6 @@ export default function RaffleDetailPage() {
         </div>
       </div>
 
-      {/* Success / error messages */}
       {success && (
         <div
           className="rounded px-4 py-3 text-sm"
@@ -770,9 +733,7 @@ export default function RaffleDetailPage() {
         </div>
       )}
 
-      {/* Stats + controls */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Quick stats */}
         <div className="lg:col-span-2 grid grid-cols-1 sm:grid-cols-2 gap-4">
           <StatCard
             label="Tickets sold"
@@ -794,15 +755,11 @@ export default function RaffleDetailPage() {
             value={stats.failedPayments.toString()}
             sub="Payment failed or cancelled"
           />
-
-          {/* ✅ NEW: Max tickets per customer as a stat card */}
           <StatCard
             label="Max per customer"
             value={`${raffle.max_tickets_per_customer ?? 3}`}
             sub="Per raffle purchase limit"
           />
-
-          {/* ✅ NEW: Winning ticket as a stat card when drawn */}
           {alreadyDrawn && (
             <StatCard
               label="Winning ticket"
@@ -816,7 +773,6 @@ export default function RaffleDetailPage() {
           )}
         </div>
 
-        {/* Controls */}
         <div
           className="rounded-lg p-4 space-y-4"
           style={{
@@ -832,7 +788,6 @@ export default function RaffleDetailPage() {
             Raffle controls
           </h2>
 
-          {/* ✅ NEW: Draw winner block */}
           <div className="space-y-2 text-sm">
             <div
               className="font-medium"
@@ -894,7 +849,6 @@ export default function RaffleDetailPage() {
             )}
           </div>
 
-          {/* Image section */}
           <div className="space-y-2 text-sm">
             <div
               className="font-medium"
@@ -910,7 +864,6 @@ export default function RaffleDetailPage() {
                 backgroundColor: COLORS.highlightCardBg,
               }}
             >
-              {/* Fixed frame; always contained (no crop, no overflow) */}
               <div className="relative w-full h-40">
                 <Image
                   src={currentImageSrc}
@@ -982,179 +935,7 @@ export default function RaffleDetailPage() {
             </button>
           </div>
 
-          {/* Editable core fields */}
-          <div className="space-y-3 text-sm">
-            <div className="space-y-1">
-              <label
-                className="font-medium"
-                style={{ color: COLORS.textSecondary }}
-              >
-                Item name
-              </label>
-              <input
-                type="text"
-                value={itemNameDraft}
-                onChange={(e) => setItemNameDraft(e.target.value)}
-                className="w-full border rounded px-3 py-2 text-sm"
-                style={{
-                  borderColor: COLORS.inputBorder,
-                  backgroundColor: COLORS.inputBg,
-                  color: COLORS.textPrimary,
-                }}
-              />
-            </div>
-
-            <div className="space-y-1">
-              <label
-                className="font-medium"
-                style={{ color: COLORS.textSecondary }}
-              >
-                Item description
-              </label>
-              <textarea
-                value={itemDescriptionDraft}
-                onChange={(e) => setItemDescriptionDraft(e.target.value)}
-                rows={3}
-                className="w-full border rounded px-3 py-2 text-sm"
-                style={{
-                  borderColor: COLORS.inputBorder,
-                  backgroundColor: COLORS.inputBg,
-                  color: COLORS.textPrimary,
-                }}
-              />
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <div className="space-y-1">
-                <label
-                  className="font-medium"
-                  style={{ color: COLORS.textSecondary }}
-                >
-                  Ticket price (€)
-                </label>
-                <input
-                  type="number"
-                  step="0.01"
-                  min="0"
-                  value={ticketPriceDraft}
-                  onChange={(e) => setTicketPriceDraft(e.target.value)}
-                  className="w-full border rounded px-3 py-2 text-sm"
-                  style={{
-                    borderColor: COLORS.inputBorder,
-                    backgroundColor: COLORS.inputBg,
-                    color: COLORS.textPrimary,
-                  }}
-                />
-              </div>
-
-              <div className="space-y-1">
-                <label
-                  className="font-medium"
-                  style={{ color: COLORS.textSecondary }}
-                >
-                  Total tickets
-                </label>
-                <input
-                  type="number"
-                  min="1"
-                  value={totalTicketsDraft}
-                  onChange={(e) => setTotalTicketsDraft(e.target.value)}
-                  className="w-full border rounded px-3 py-2 text-sm"
-                  style={{
-                    borderColor: COLORS.inputBorder,
-                    backgroundColor: COLORS.inputBg,
-                    color: COLORS.textPrimary,
-                  }}
-                />
-              </div>
-            </div>
-
-            {/* ✅ NEW: Max tickets per customer */}
-            <div className="space-y-1">
-              <label
-                className="font-medium"
-                style={{ color: COLORS.textSecondary }}
-              >
-                Max tickets / customer
-              </label>
-              <input
-                type="number"
-                min="1"
-                max="1000"
-                value={maxTicketsPerCustomerDraft}
-                onChange={(e) => setMaxTicketsPerCustomerDraft(e.target.value)}
-                className="w-full border rounded px-3 py-2 text-sm"
-                style={{
-                  borderColor: COLORS.inputBorder,
-                  backgroundColor: COLORS.inputBg,
-                  color: COLORS.textPrimary,
-                }}
-              />
-              <p className="text-[0.7rem]" style={{ color: COLORS.textMuted }}>
-                Purchase limit per customer for this raffle (default: 3).
-              </p>
-            </div>
-          </div>
-
-          {/* Status select */}
-          <div className="space-y-1">
-            <label
-              className="text-sm font-medium"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Status
-            </label>
-            <select
-              value={statusDraft}
-              onChange={(e) =>
-                setStatusDraft(e.target.value as RaffleDetail["status"])
-              }
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-            >
-              {STATUS_OPTIONS.map((s) => (
-                <option key={s} value={s}>
-                  {s === "active"
-                    ? "Active"
-                    : s === "soldout"
-                    ? "Sold out"
-                    : s === "drawn"
-                    ? "Drawn"
-                    : "Cancelled"}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {/* Draw date */}
-          <div className="space-y-1">
-            <label
-              className="text-sm font-medium"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Draw date
-            </label>
-            <input
-              type="datetime-local"
-              value={drawDateDraft}
-              onChange={(e) => setDrawDateDraft(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-            />
-            <p className="text-xs" style={{ color: COLORS.textMuted }}>
-              Leave empty to clear draw date.
-            </p>
-          </div>
-
-          {/* Refresh */}
+          {/* Save controls */}
           <button
             type="button"
             onClick={fetchDetail}
@@ -1168,7 +949,6 @@ export default function RaffleDetailPage() {
             Refresh data
           </button>
 
-          {/* Save button */}
           <button
             type="button"
             onClick={handleSave}
@@ -1223,7 +1003,6 @@ export default function RaffleDetailPage() {
               {winner.county && <>County: {winner.county}</>}
             </div>
 
-            {/* ✅ NEW: winning ticket audit */}
             <div className="text-xs mt-2" style={{ color: COLORS.textMuted }}>
               Winning ticket:{" "}
               <span style={{ color: COLORS.textSecondary, fontWeight: 700 }}>
@@ -1295,6 +1074,7 @@ export default function RaffleDetailPage() {
                 }}
               >
                 <tr>
+                  <th className="px-3 py-2 text-left">Ticket code</th>
                   <th className="px-3 py-2 text-left">Ticket #</th>
                   <th className="px-3 py-2 text-left">Payment status</th>
                   <th className="px-3 py-2 text-left">Winner</th>
@@ -1310,6 +1090,16 @@ export default function RaffleDetailPage() {
                     className="border-t"
                     style={{ borderColor: COLORS.cardBorder }}
                   >
+                    <td className="px-3 py-2 align-top">
+                      <span
+                        style={{
+                          color: COLORS.textSecondary,
+                          fontSize: "0.75rem",
+                        }}
+                      >
+                        {t.ticket_code ?? "-"}
+                      </span>
+                    </td>
                     <td className="px-3 py-2 align-top">
                       <span style={{ color: COLORS.textPrimary }}>
                         {t.ticket_number}
@@ -1351,6 +1141,14 @@ export default function RaffleDetailPage() {
                           ? new Date(t.purchased_at).toLocaleString("en-IE")
                           : "-"}
                       </span>
+                      <div
+                        style={{ color: COLORS.textMuted, fontSize: "0.7rem" }}
+                      >
+                        Created:{" "}
+                        {t.created_at
+                          ? new Date(t.created_at).toLocaleString("en-IE")
+                          : "-"}
+                      </div>
                     </td>
                     <td className="px-3 py-2 align-top text-right">
                       <span style={{ color: COLORS.textPrimary }}>

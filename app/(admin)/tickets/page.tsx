@@ -1,23 +1,27 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
 
 type PaymentStatus = "pending" | "completed" | "failed";
 type StatusFilter = PaymentStatus | "all";
 
+/**
+ * Supabase nested select may return:
+ * - a single object (if relationship is recognized)
+ * - an array of objects (common when relationship inference differs)
+ * - null
+ */
+type OneOrMany<T> = T | T[] | null;
+
 type TicketRow = {
   id: string;
   raffle_id: string;
   customer_id: string;
-
-  // New global code
+  ticket_number: number;
   ticket_code: string | null;
-
-  // Keep existing number for backwards compatibility
-  ticket_number: number | null;
 
   payment_status: PaymentStatus | string;
   payment_intent_id: string | null;
@@ -31,149 +35,30 @@ type TicketRow = {
   payment_error: string | null;
 
   is_winner: boolean | null;
+
   created_at: string | null;
 
-  raffles: { id: string; item_name: string } | null;
-  customers: { id: string; email: string } | null;
+  raffles?: {
+    id: string;
+    item_name: string;
+  } | null;
+
+  customers?: {
+    id: string;
+    email: string;
+  } | null;
 };
 
 /**
- * Supabase nested select may return:
- * - object
- * - array
- * - null
+ * Raw shape returned from Supabase for this query.
+ * Note: nested relations can arrive as OneOrMany<...>
  */
-type OneOrMany<T> = T | T[] | null;
-
-type TicketRowRaw = {
-  id?: unknown;
-  raffle_id?: unknown;
-  customer_id?: unknown;
-  ticket_code?: unknown;
-  ticket_number?: unknown;
-
-  payment_status?: unknown;
-  payment_intent_id?: unknown;
-  checkout_session_id?: unknown;
-
-  payment_amount?: unknown;
-  payment_currency?: unknown;
-  payment_method?: unknown;
-
-  payment_completed_at?: unknown;
-  payment_error?: unknown;
-
-  is_winner?: unknown;
-  created_at?: unknown;
-
-  raffles?: OneOrMany<{ id?: unknown; item_name?: unknown }>;
-  customers?: OneOrMany<{ id?: unknown; email?: unknown }>;
+type TicketRowRaw = Omit<TicketRow, "raffles" | "customers"> & {
+  raffles?: OneOrMany<{ id: string; item_name: string }>;
+  customers?: OneOrMany<{ id: string; email: string }>;
 };
 
 const PAGE_SIZE = 25;
-
-function isStatusFilter(v: string): v is StatusFilter {
-  return v === "all" || v === "pending" || v === "completed" || v === "failed";
-}
-
-function toStringOrNull(v: unknown): string | null {
-  if (v == null) return null;
-  if (typeof v === "string") return v;
-  return String(v);
-}
-
-function toString(v: unknown): string | null {
-  return typeof v === "string" ? v : null;
-}
-
-function toNumberOrNull(v: unknown): number | null {
-  if (v == null) return null;
-  const n = typeof v === "number" ? v : Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-function toBooleanOrNull(v: unknown): boolean | null {
-  if (v == null) return null;
-  if (typeof v === "boolean") return v;
-  if (v === 1 || v === "1" || v === "true") return true;
-  if (v === 0 || v === "0" || v === "false") return false;
-  return null;
-}
-
-function firstOrNull<T>(v: OneOrMany<T> | undefined): T | null {
-  if (!v) return null;
-  return Array.isArray(v) ? v[0] ?? null : v;
-}
-
-function normalizeRaffle(
-  v: OneOrMany<{ id?: unknown; item_name?: unknown }> | undefined
-): { id: string; item_name: string } | null {
-  const one = firstOrNull(v);
-  if (!one) return null;
-
-  const id = toString(one.id);
-  const item_name = toString(one.item_name);
-
-  if (!id || !item_name) return null;
-  return { id, item_name };
-}
-
-function normalizeCustomer(
-  v: OneOrMany<{ id?: unknown; email?: unknown }> | undefined
-): { id: string; email: string } | null {
-  const one = firstOrNull(v);
-  if (!one) return null;
-
-  const id = toString(one.id);
-  const email = toString(one.email);
-
-  if (!id || !email) return null;
-  return { id, email };
-}
-
-function normalizeTicketRow(raw: TicketRowRaw): TicketRow | null {
-  const id = toString(raw.id);
-  const raffle_id = toString(raw.raffle_id);
-  const customer_id = toString(raw.customer_id);
-
-  if (!id || !raffle_id || !customer_id) return null;
-
-  const ticket_code = toStringOrNull(raw.ticket_code);
-  const ticket_number = toNumberOrNull(raw.ticket_number);
-
-  const payment_status =
-    typeof raw.payment_status === "string"
-      ? raw.payment_status
-      : raw.payment_status != null
-      ? String(raw.payment_status)
-      : "pending";
-
-  return {
-    id,
-    raffle_id,
-    customer_id,
-
-    ticket_code,
-    ticket_number,
-
-    payment_status,
-    payment_intent_id: toStringOrNull(raw.payment_intent_id),
-    checkout_session_id: toStringOrNull(raw.checkout_session_id),
-
-    payment_amount: toNumberOrNull(raw.payment_amount),
-    payment_currency: toStringOrNull(raw.payment_currency),
-    payment_method: toStringOrNull(raw.payment_method),
-
-    payment_completed_at: toStringOrNull(raw.payment_completed_at),
-    payment_error: toStringOrNull(raw.payment_error),
-
-    is_winner: toBooleanOrNull(raw.is_winner),
-    created_at: toStringOrNull(raw.created_at),
-
-    raffles: normalizeRaffle(raw.raffles),
-    customers: normalizeCustomer(raw.customers),
-  };
-}
 
 function formatMoney(amount: number | null, currency: string | null) {
   if (amount == null) return "—";
@@ -194,6 +79,15 @@ function shortId(id?: string | null) {
   return id.length > 10 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
 }
 
+function firstOrNull<T>(v: OneOrMany<T> | undefined): T | null {
+  if (!v) return null;
+  return Array.isArray(v) ? v[0] ?? null : v;
+}
+
+function isStatusFilter(v: string): v is StatusFilter {
+  return v === "all" || v === "pending" || v === "completed" || v === "failed";
+}
+
 export default function AdminTicketsPage() {
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -210,7 +104,7 @@ export default function AdminTicketsPage() {
   const [rows, setRows] = useState<TicketRow[]>([]);
   const [totalCount, setTotalCount] = useState<number>(0);
 
-  // Debounce q
+  // Debounce query so we don’t spam Supabase
   const qRef = useRef<number | null>(null);
   const [qDebounced, setQDebounced] = useState("");
   useEffect(() => {
@@ -226,12 +120,12 @@ export default function AdminTicketsPage() {
     return Math.max(1, pages);
   }, [totalCount]);
 
-  // Reset page on filter change
+  // Reset to page 1 when filters change
   useEffect(() => {
     setPage(1);
   }, [qDebounced, status, winnerOnly, raffleId, customerId]);
 
-  const fetchTickets = async () => {
+  const fetchTickets = useCallback(async () => {
     try {
       setLoading(true);
       setFetchError(null);
@@ -246,8 +140,8 @@ export default function AdminTicketsPage() {
             id,
             raffle_id,
             customer_id,
-            ticket_code,
             ticket_number,
+            ticket_code,
             payment_status,
             payment_intent_id,
             checkout_session_id,
@@ -271,7 +165,7 @@ export default function AdminTicketsPage() {
       if (raffleId.trim()) query = query.eq("raffle_id", raffleId.trim());
       if (customerId.trim()) query = query.eq("customer_id", customerId.trim());
 
-      // Search across ticket-side fields
+      // Ticket-side search only (safe / reliable)
       const search = qDebounced;
       if (search) {
         query = query.or(
@@ -283,19 +177,21 @@ export default function AdminTicketsPage() {
         );
       }
 
-      const { data, error, count } = await query.range(from, to);
+      // IMPORTANT: strongly type the response to avoid `any` and array-vs-object mismatch issues.
+      const { data, error, count } = await query
+        .range(from, to)
+        .returns<TicketRowRaw[]>();
 
       if (error) throw error;
 
-      const rawList: TicketRowRaw[] = Array.isArray(data)
-        ? (data as unknown as TicketRowRaw[])
-        : [];
+      const rawRows = data ?? [];
 
-      const normalized: TicketRow[] = [];
-      for (const r of rawList) {
-        const n = normalizeTicketRow(r);
-        if (n) normalized.push(n);
-      }
+      // Normalize nested relations so UI always receives single objects or null
+      const normalized: TicketRow[] = rawRows.map((r) => ({
+        ...r,
+        raffles: firstOrNull(r.raffles),
+        customers: firstOrNull(r.customers),
+      }));
 
       setRows(normalized);
       setTotalCount(count ?? 0);
@@ -309,14 +205,13 @@ export default function AdminTicketsPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [page, qDebounced, status, winnerOnly, raffleId, customerId]);
 
   useEffect(() => {
     fetchTickets();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, qDebounced, status, winnerOnly, raffleId, customerId]);
+  }, [fetchTickets]);
 
-  // Realtime refresh
+  // Realtime refresh: if any ticket changes, re-fetch current page.
   useEffect(() => {
     const channel = supabase
       .channel("admin_tickets_live")
@@ -332,8 +227,7 @@ export default function AdminTicketsPage() {
     return () => {
       supabase.removeChannel(channel);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, qDebounced, status, winnerOnly, raffleId, customerId]);
+  }, [fetchTickets]);
 
   return (
     <div className="space-y-6">
@@ -347,8 +241,9 @@ export default function AdminTicketsPage() {
             Tickets
           </h1>
           <p className="text-sm" style={{ color: COLORS.textSecondary }}>
-            Admin view of ticket purchases. Primary identifier is ticket code
-            (global).
+            Admin view of all ticket purchases across raffles. Filter by status,
+            winners, raffle/customer IDs, and search by payment/session
+            identifiers.
           </p>
         </div>
 
@@ -414,8 +309,12 @@ export default function AdminTicketsPage() {
                 backgroundColor: COLORS.inputBg,
                 color: COLORS.textPrimary,
               }}
-              placeholder="e.g. ABCD23K9 or cs_test_... or pi_..."
+              placeholder="e.g. SW-000123-AB12CD or cs_test_... or pi_..."
             />
+            <p className="text-xs" style={{ color: COLORS.textMuted }}>
+              This search targets ticket fields only. For customer email search,
+              add a 2-step lookup later.
+            </p>
           </div>
 
           <div className="space-y-2">
@@ -568,7 +467,6 @@ export default function AdminTicketsPage() {
                 <th className="px-5 py-3 font-medium">Refs</th>
               </tr>
             </thead>
-
             <tbody>
               {loading ? (
                 <tr>
@@ -605,7 +503,7 @@ export default function AdminTicketsPage() {
                       ? "Pending"
                       : t.payment_status === "failed"
                       ? "Failed"
-                      : String(t.payment_status);
+                      : t.payment_status;
 
                   const statusBg =
                     t.payment_status === "completed"
@@ -630,19 +528,6 @@ export default function AdminTicketsPage() {
                       ? COLORS.error
                       : COLORS.textPrimary;
 
-                  const ticketLabel = t.ticket_code
-                    ? t.ticket_code
-                    : t.ticket_number != null
-                    ? `#${t.ticket_number}`
-                    : "—";
-
-                  const subLabel =
-                    t.ticket_code && t.ticket_number != null
-                      ? `Legacy #: ${t.ticket_number}`
-                      : t.ticket_code
-                      ? "Ticket code"
-                      : "Ticket";
-
                   return (
                     <tr
                       key={t.id}
@@ -656,17 +541,15 @@ export default function AdminTicketsPage() {
                             className="font-semibold underline"
                             style={{ color: COLORS.primary }}
                           >
-                            {ticketLabel}
+                            #{t.ticket_number}
                             {t.is_winner ? " • WINNER" : ""}
                           </Link>
-
                           <div
                             className="text-xs"
                             style={{ color: COLORS.textMuted }}
                           >
-                            {subLabel}
+                            Code: {t.ticket_code ?? "—"}
                           </div>
-
                           <div
                             className="text-xs"
                             style={{ color: COLORS.textMuted }}
@@ -723,7 +606,6 @@ export default function AdminTicketsPage() {
                         >
                           {statusLabel}
                         </span>
-
                         {t.payment_status === "failed" && t.payment_error ? (
                           <div
                             className="text-xs mt-1"
@@ -794,9 +676,15 @@ export default function AdminTicketsPage() {
           style={{ borderColor: COLORS.cardBorder }}
         >
           <div className="text-sm" style={{ color: COLORS.textSecondary }}>
-            Showing {(page - 1) * PAGE_SIZE + 1}–
-            {Math.min(page * PAGE_SIZE, totalCount)} of{" "}
-            {totalCount.toLocaleString()}
+            {totalCount > 0 ? (
+              <>
+                Showing {(page - 1) * PAGE_SIZE + 1}–
+                {Math.min(page * PAGE_SIZE, totalCount)} of{" "}
+                {totalCount.toLocaleString()}
+              </>
+            ) : (
+              <>Showing 0 of 0</>
+            )}
           </div>
 
           <div className="flex gap-2">
@@ -831,7 +719,7 @@ export default function AdminTicketsPage() {
         </div>
       </div>
 
-      {/* Notes */}
+      {/* Admin ops notes */}
       <div
         className="rounded-2xl p-5 border text-sm"
         style={{
@@ -844,15 +732,16 @@ export default function AdminTicketsPage() {
           className="font-semibold mb-2"
           style={{ color: COLORS.textPrimary }}
         >
-          Notes
+          Typical admin use cases covered here
         </div>
         <ul className="list-disc pl-5 space-y-1">
-          <li>Ticket code is the primary identifier (global unique).</li>
-          <li>Legacy ticket number is still displayed where it exists.</li>
-          <li>Nested relations are normalized (object/array/null safe).</li>
+          <li>Audit all purchases by status (completed/pending/failed).</li>
+          <li>Investigate failed payments (view error + Stripe references).</li>
+          <li>Confirm winning tickets (filter Winner tickets only).</li>
           <li>
-            Realtime refresh triggers on any tickets insert/update/delete.
+            Jump to the related customer page or raffle page for deeper context.
           </li>
+          <li>Realtime refresh on any ticket insert/update/delete.</li>
         </ul>
       </div>
     </div>
