@@ -1,89 +1,49 @@
+// app/(admin)/raffles/page.tsx
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
 
-type PaymentStatus = "pending" | "completed" | "failed";
-type StatusFilter = PaymentStatus | "all";
+type RaffleStatus = "active" | "soldout" | "drawn" | "cancelled";
+type StatusFilter = "all" | RaffleStatus;
 
-type TicketRow = {
+type RaffleRow = {
   id: string;
-  raffle_id: string;
-  customer_id: string;
-
-  // New global code
-  ticket_code: string | null;
-
-  // Keep existing number for backwards compatibility
-  ticket_number: number | null;
-
-  payment_status: PaymentStatus | string;
-  payment_intent_id: string | null;
-  checkout_session_id: string | null;
-
-  payment_amount: number | null;
-  payment_currency: string | null;
-  payment_method: string | null;
-
-  payment_completed_at: string | null;
-  payment_error: string | null;
-
-  is_winner: boolean | null;
-  created_at: string | null;
-
-  raffles: { id: string; item_name: string } | null;
-  customers: { id: string; email: string } | null;
+  item_name: string;
+  item_image_url: string | null;
+  status: RaffleStatus;
+  total_tickets: number;
+  sold_tickets: number | null;
+  ticket_price: number | string;
+  draw_date: string | null;
+  created_at: string;
+  max_tickets_per_customer: number; // expected to exist, fallback handled
 };
 
 /**
- * Supabase nested select may return:
- * - object
- * - array
- * - null
+ * Raw shape from Supabase (unknown / any-safe).
+ * We normalize this to RaffleRow with runtime guards.
  */
-type OneOrMany<T> = T | T[] | null;
-
-type TicketRowRaw = {
+type RaffleRowRaw = {
   id?: unknown;
-  raffle_id?: unknown;
-  customer_id?: unknown;
-  ticket_code?: unknown;
-  ticket_number?: unknown;
-
-  payment_status?: unknown;
-  payment_intent_id?: unknown;
-  checkout_session_id?: unknown;
-
-  payment_amount?: unknown;
-  payment_currency?: unknown;
-  payment_method?: unknown;
-
-  payment_completed_at?: unknown;
-  payment_error?: unknown;
-
-  is_winner?: unknown;
+  item_name?: unknown;
+  item_image_url?: unknown;
+  status?: unknown;
+  total_tickets?: unknown;
+  sold_tickets?: unknown;
+  ticket_price?: unknown;
+  draw_date?: unknown;
   created_at?: unknown;
-
-  raffles?: OneOrMany<{ id?: unknown; item_name?: unknown }>;
-  customers?: OneOrMany<{ id?: unknown; email?: unknown }>;
+  max_tickets_per_customer?: unknown;
 };
 
-const PAGE_SIZE = 25;
-
-function isStatusFilter(v: string): v is StatusFilter {
-  return v === "all" || v === "pending" || v === "completed" || v === "failed";
-}
-
-function toStringOrNull(v: unknown): string | null {
-  if (v == null) return null;
-  if (typeof v === "string") return v;
-  return String(v);
-}
-
-function toString(v: unknown): string | null {
-  return typeof v === "string" ? v : null;
+function isRaffleStatus(v: unknown): v is RaffleStatus {
+  return (
+    v === "active" || v === "soldout" || v === "drawn" || v === "cancelled"
+  );
 }
 
 function toNumberOrNull(v: unknown): number | null {
@@ -92,769 +52,463 @@ function toNumberOrNull(v: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-function toBooleanOrNull(v: unknown): boolean | null {
+function toStringOrNull(v: unknown): string | null {
   if (v == null) return null;
-  if (typeof v === "boolean") return v;
-  if (v === 1 || v === "1" || v === "true") return true;
-  if (v === 0 || v === "0" || v === "false") return false;
-  return null;
+  return typeof v === "string" ? v : String(v);
 }
 
-function firstOrNull<T>(v: OneOrMany<T> | undefined): T | null {
-  if (!v) return null;
-  return Array.isArray(v) ? v[0] ?? null : v;
-}
+function normalizeRaffleRow(raw: RaffleRowRaw): RaffleRow | null {
+  const id = typeof raw.id === "string" ? raw.id : null;
+  const item_name = typeof raw.item_name === "string" ? raw.item_name : null;
+  const status = isRaffleStatus(raw.status) ? raw.status : null;
 
-function normalizeRaffle(
-  v: OneOrMany<{ id?: unknown; item_name?: unknown }> | undefined
-): { id: string; item_name: string } | null {
-  const one = firstOrNull(v);
-  if (!one) return null;
+  const total_tickets = toNumberOrNull(raw.total_tickets);
+  const sold_tickets = toNumberOrNull(raw.sold_tickets);
 
-  const id = toString(one.id);
-  const item_name = toString(one.item_name);
+  const created_at = typeof raw.created_at === "string" ? raw.created_at : null;
 
-  if (!id || !item_name) return null;
-  return { id, item_name };
-}
+  if (!id || !item_name || !status || total_tickets == null || !created_at) {
+    return null;
+  }
 
-function normalizeCustomer(
-  v: OneOrMany<{ id?: unknown; email?: unknown }> | undefined
-): { id: string; email: string } | null {
-  const one = firstOrNull(v);
-  if (!one) return null;
+  const item_image_url = toStringOrNull(raw.item_image_url);
+  const draw_date = toStringOrNull(raw.draw_date);
 
-  const id = toString(one.id);
-  const email = toString(one.email);
+  // ticket_price can be number or string (as in your schema)
+  const ticket_price =
+    typeof raw.ticket_price === "number" || typeof raw.ticket_price === "string"
+      ? raw.ticket_price
+      : 0;
 
-  if (!id || !email) return null;
-  return { id, email };
-}
-
-function normalizeTicketRow(raw: TicketRowRaw): TicketRow | null {
-  const id = toString(raw.id);
-  const raffle_id = toString(raw.raffle_id);
-  const customer_id = toString(raw.customer_id);
-
-  if (!id || !raffle_id || !customer_id) return null;
-
-  const ticket_code = toStringOrNull(raw.ticket_code);
-  const ticket_number = toNumberOrNull(raw.ticket_number);
-
-  const payment_status =
-    typeof raw.payment_status === "string"
-      ? raw.payment_status
-      : raw.payment_status != null
-      ? String(raw.payment_status)
-      : "pending";
+  const maxTPC = toNumberOrNull(raw.max_tickets_per_customer);
+  const max_tickets_per_customer = maxTPC != null && maxTPC >= 1 ? maxTPC : 3;
 
   return {
     id,
-    raffle_id,
-    customer_id,
-
-    ticket_code,
-    ticket_number,
-
-    payment_status,
-    payment_intent_id: toStringOrNull(raw.payment_intent_id),
-    checkout_session_id: toStringOrNull(raw.checkout_session_id),
-
-    payment_amount: toNumberOrNull(raw.payment_amount),
-    payment_currency: toStringOrNull(raw.payment_currency),
-    payment_method: toStringOrNull(raw.payment_method),
-
-    payment_completed_at: toStringOrNull(raw.payment_completed_at),
-    payment_error: toStringOrNull(raw.payment_error),
-
-    is_winner: toBooleanOrNull(raw.is_winner),
-    created_at: toStringOrNull(raw.created_at),
-
-    raffles: normalizeRaffle(raw.raffles),
-    customers: normalizeCustomer(raw.customers),
+    item_name,
+    item_image_url,
+    status,
+    total_tickets,
+    sold_tickets,
+    ticket_price,
+    draw_date,
+    created_at,
+    max_tickets_per_customer,
   };
 }
 
-function formatMoney(amount: number | null, currency: string | null) {
-  if (amount == null) return "—";
-  const c = (currency || "eur").toUpperCase();
-  try {
-    return new Intl.NumberFormat("en-IE", {
-      style: "currency",
-      currency: c,
-      maximumFractionDigits: 2,
-    }).format(amount);
-  } catch {
-    return `${amount.toFixed(2)} ${c}`;
-  }
-}
-
-function shortId(id?: string | null) {
-  if (!id) return "—";
-  return id.length > 10 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
-}
-
-export default function AdminTicketsPage() {
+export default function RafflesPage() {
+  const [raffles, setRaffles] = useState<RaffleRow[]>([]);
   const [loading, setLoading] = useState(true);
-  const [fetchError, setFetchError] = useState<string | null>(null);
-
-  // Filters
-  const [q, setQ] = useState(""); // searches ticket_code, session_id, payment_intent_id
-  const [status, setStatus] = useState<StatusFilter>("all");
-  const [winnerOnly, setWinnerOnly] = useState(false);
-  const [raffleId, setRaffleId] = useState("");
-  const [customerId, setCustomerId] = useState("");
-
-  // Pagination
-  const [page, setPage] = useState(1);
-  const [rows, setRows] = useState<TicketRow[]>([]);
-  const [totalCount, setTotalCount] = useState<number>(0);
-
-  // Debounce q
-  const qRef = useRef<number | null>(null);
-  const [qDebounced, setQDebounced] = useState("");
-  useEffect(() => {
-    if (qRef.current) window.clearTimeout(qRef.current);
-    qRef.current = window.setTimeout(() => setQDebounced(q.trim()), 250);
-    return () => {
-      if (qRef.current) window.clearTimeout(qRef.current);
-    };
-  }, [q]);
-
-  const totalPages = useMemo(() => {
-    const pages = Math.ceil((totalCount || 0) / PAGE_SIZE);
-    return Math.max(1, pages);
-  }, [totalCount]);
-
-  // Reset page on filter change
-  useEffect(() => {
-    setPage(1);
-  }, [qDebounced, status, winnerOnly, raffleId, customerId]);
-
-  const fetchTickets = async () => {
-    try {
-      setLoading(true);
-      setFetchError(null);
-
-      const from = (page - 1) * PAGE_SIZE;
-      const to = from + PAGE_SIZE - 1;
-
-      let query = supabase
-        .from("tickets")
-        .select(
-          `
-            id,
-            raffle_id,
-            customer_id,
-            ticket_code,
-            ticket_number,
-            payment_status,
-            payment_intent_id,
-            checkout_session_id,
-            payment_amount,
-            payment_currency,
-            payment_method,
-            payment_completed_at,
-            payment_error,
-            is_winner,
-            created_at,
-            raffles ( id, item_name ),
-            customers ( id, email )
-          `,
-          { count: "exact" }
-        )
-        .order("created_at", { ascending: false });
-
-      // Filters
-      if (status !== "all") query = query.eq("payment_status", status);
-      if (winnerOnly) query = query.eq("is_winner", true);
-      if (raffleId.trim()) query = query.eq("raffle_id", raffleId.trim());
-      if (customerId.trim()) query = query.eq("customer_id", customerId.trim());
-
-      // Search across ticket-side fields
-      const search = qDebounced;
-      if (search) {
-        query = query.or(
-          [
-            `ticket_code.ilike.%${search}%`,
-            `checkout_session_id.ilike.%${search}%`,
-            `payment_intent_id.ilike.%${search}%`,
-          ].join(",")
-        );
-      }
-
-      const { data, error, count } = await query.range(from, to);
-
-      if (error) throw error;
-
-      const rawList: TicketRowRaw[] = Array.isArray(data)
-        ? (data as unknown as TicketRowRaw[])
-        : [];
-
-      const normalized: TicketRow[] = [];
-      for (const r of rawList) {
-        const n = normalizeTicketRow(r);
-        if (n) normalized.push(n);
-      }
-
-      setRows(normalized);
-      setTotalCount(count ?? 0);
-    } catch (err: unknown) {
-      console.error("Admin tickets fetch error:", err);
-      setFetchError(
-        err instanceof Error ? err.message : "Failed to load tickets."
-      );
-      setRows([]);
-      setTotalCount(0);
-    } finally {
-      setLoading(false);
-    }
-  };
+  const [error, setError] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
 
   useEffect(() => {
-    fetchTickets();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, qDebounced, status, winnerOnly, raffleId, customerId]);
+    const fetchRaffles = async () => {
+      try {
+        setLoading(true);
+        setError(null);
 
-  // Realtime refresh
-  useEffect(() => {
-    const channel = supabase
-      .channel("admin_tickets_live")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "tickets" },
-        () => {
-          fetchTickets();
+        const { data, error: qErr } = await supabase
+          .from("raffles")
+          .select(
+            "id, item_name, item_image_url, status, total_tickets, sold_tickets, ticket_price, draw_date, created_at, max_tickets_per_customer"
+          )
+          .order("created_at", { ascending: false });
+
+        if (qErr) throw qErr;
+
+        const rawList: RaffleRowRaw[] = Array.isArray(data)
+          ? (data as unknown as RaffleRowRaw[])
+          : [];
+
+        const normalized: RaffleRow[] = [];
+        for (const r of rawList) {
+          const n = normalizeRaffleRow(r);
+          if (n) normalized.push(n);
         }
-      )
-      .subscribe();
 
-    return () => {
-      supabase.removeChannel(channel);
+        setRaffles(normalized);
+      } catch (err: unknown) {
+        console.error("Error loading raffles:", err);
+        setError(
+          err instanceof Error ? err.message : "Failed to load raffles."
+        );
+        setRaffles([]);
+      } finally {
+        setLoading(false);
+      }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, qDebounced, status, winnerOnly, raffleId, customerId]);
+
+    fetchRaffles();
+  }, []);
+
+  const filteredRaffles = useMemo(() => {
+    if (statusFilter === "all") return raffles;
+    return raffles.filter((r) => r.status === statusFilter);
+  }, [raffles, statusFilter]);
 
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
+      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
         <div>
           <h1
             className="text-3xl font-bold tracking-tight mb-1"
             style={{ color: COLORS.primary }}
           >
-            Tickets
+            Raffles
           </h1>
           <p className="text-sm" style={{ color: COLORS.textSecondary }}>
-            Admin view of ticket purchases. Primary identifier is ticket code
-            (global).
+            Manage and review all SnapWin raffles.
           </p>
         </div>
 
+        <div className="flex flex-col md:flex-row gap-3 md:items-center">
+          {/* Status filters */}
+          <div className="flex flex-wrap gap-2">
+            <StatusFilterButton
+              label="All"
+              value="all"
+              activeValue={statusFilter}
+              onClick={setStatusFilter}
+            />
+            <StatusFilterButton
+              label="Active"
+              value="active"
+              activeValue={statusFilter}
+              onClick={setStatusFilter}
+            />
+            <StatusFilterButton
+              label="Sold out"
+              value="soldout"
+              activeValue={statusFilter}
+              onClick={setStatusFilter}
+            />
+            <StatusFilterButton
+              label="Drawn"
+              value="drawn"
+              activeValue={statusFilter}
+              onClick={setStatusFilter}
+            />
+            <StatusFilterButton
+              label="Cancelled"
+              value="cancelled"
+              activeValue={statusFilter}
+              onClick={setStatusFilter}
+            />
+          </div>
+
+          {/* New raffle button */}
+          <Link
+            href="/raffles/create"
+            className="px-4 py-2 rounded-full text-sm font-medium text-center shadow-sm"
+            style={{
+              backgroundColor: COLORS.primaryButtonBg,
+              color: COLORS.primaryButtonText,
+              boxShadow: `0 10px 24px ${COLORS.cardShadow}`,
+            }}
+          >
+            + New raffle
+          </Link>
+        </div>
+      </div>
+
+      {/* Error / Loading */}
+      {error && (
         <div
-          className="rounded-2xl px-4 py-3 border text-sm"
+          className="rounded-2xl px-4 py-3 text-sm border"
+          style={{
+            backgroundColor: "#FEF2F2",
+            borderColor: "#FCA5A5",
+            color: COLORS.error,
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      {loading && !error && (
+        <div
+          className="rounded-2xl px-4 py-3 text-sm border animate-pulse"
+          style={{
+            backgroundColor: COLORS.highlightCardBg,
+            borderColor: COLORS.cardBorder,
+            color: COLORS.textSecondary,
+          }}
+        >
+          Loading raffles...
+        </div>
+      )}
+
+      {/* Table card */}
+      {!loading && !error && (
+        <div
+          className="rounded-2xl overflow-hidden border"
           style={{
             backgroundColor: COLORS.cardBg,
             borderColor: COLORS.cardBorder,
-            color: COLORS.textSecondary,
-            boxShadow: `0 12px 30px ${COLORS.cardShadow}`,
+            boxShadow: `0 18px 40px ${COLORS.cardShadow}`,
           }}
         >
-          <div className="flex gap-4 flex-wrap">
-            <div>
-              <div className="text-xs" style={{ color: COLORS.textMuted }}>
-                Total tickets
-              </div>
+          {filteredRaffles.length === 0 ? (
+            <div className="p-8 text-center space-y-2">
               <div
-                className="font-semibold"
+                className="text-sm font-medium"
                 style={{ color: COLORS.textPrimary }}
               >
-                {loading ? "—" : totalCount.toLocaleString()}
-              </div>
-            </div>
-            <div>
-              <div className="text-xs" style={{ color: COLORS.textMuted }}>
-                Page
+                No raffles found
               </div>
               <div
-                className="font-semibold"
-                style={{ color: COLORS.textPrimary }}
+                className="text-xs max-w-md mx-auto"
+                style={{ color: COLORS.textSecondary }}
               >
-                {page} / {totalPages}
+                Try switching the status filter or create a new raffle to see it
+                listed here.
               </div>
             </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Filters */}
-      <div
-        className="rounded-2xl p-5 border space-y-4"
-        style={{
-          backgroundColor: COLORS.cardBg,
-          borderColor: COLORS.cardBorder,
-          boxShadow: `0 18px 40px ${COLORS.cardShadow}`,
-        }}
-      >
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-          <div className="space-y-2 md:col-span-2">
-            <label
-              className="text-sm font-medium"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Search (ticket code / checkout session / payment intent)
-            </label>
-            <input
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-              placeholder="e.g. ABCD23K9 or cs_test_... or pi_..."
-            />
-          </div>
-
-          <div className="space-y-2">
-            <label
-              className="text-sm font-medium"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Payment status
-            </label>
-            <select
-              value={status}
-              onChange={(e) => {
-                const v = e.target.value;
-                if (isStatusFilter(v)) setStatus(v);
-              }}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-            >
-              <option value="all">All</option>
-              <option value="completed">Completed</option>
-              <option value="pending">Pending</option>
-              <option value="failed">Failed</option>
-            </select>
-
-            <label
-              className="flex items-center gap-2 text-sm mt-2"
-              style={{ color: COLORS.textSecondary }}
-            >
-              <input
-                type="checkbox"
-                checked={winnerOnly}
-                onChange={(e) => setWinnerOnly(e.target.checked)}
-              />
-              Winner tickets only
-            </label>
-          </div>
-
-          <div className="space-y-2">
-            <label
-              className="text-sm font-medium"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Raffle ID (exact)
-            </label>
-            <input
-              value={raffleId}
-              onChange={(e) => setRaffleId(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-              placeholder="uuid"
-            />
-
-            <label
-              className="text-sm font-medium mt-3 block"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Customer ID (exact)
-            </label>
-            <input
-              value={customerId}
-              onChange={(e) => setCustomerId(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-              placeholder="uuid"
-            />
-          </div>
-        </div>
-
-        {fetchError && (
-          <div
-            className="rounded-2xl px-4 py-3 text-sm border"
-            style={{
-              backgroundColor: "#FEF2F2",
-              borderColor: "#FCA5A5",
-              color: COLORS.error,
-            }}
-          >
-            {fetchError}
-          </div>
-        )}
-      </div>
-
-      {/* Table */}
-      <div
-        className="rounded-2xl border overflow-hidden"
-        style={{
-          backgroundColor: COLORS.cardBg,
-          borderColor: COLORS.cardBorder,
-          boxShadow: `0 18px 40px ${COLORS.cardShadow}`,
-        }}
-      >
-        <div
-          className="px-5 py-4 border-b"
-          style={{ borderColor: COLORS.cardBorder }}
-        >
-          <div className="flex items-center justify-between gap-3">
-            <div
-              className="text-sm font-semibold"
-              style={{ color: COLORS.textPrimary }}
-            >
-              Results
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-sm">
+                <thead
+                  style={{
+                    backgroundColor: COLORS.highlightCardBg,
+                    color: COLORS.textSecondary,
+                  }}
+                >
+                  <tr>
+                    <Th>Item</Th>
+                    <Th>Status</Th>
+                    <Th className="text-right">Ticket price</Th>
+                    <Th className="text-right">Tickets</Th>
+                    <Th className="text-right">Sold %</Th>
+                    <Th className="text-right">Max / customer</Th>
+                    <Th>Draw date</Th>
+                    <Th>Created</Th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredRaffles.map((raffle, index) => (
+                    <RaffleRowItem
+                      key={raffle.id}
+                      raffle={raffle}
+                      striped={index % 2 === 1}
+                    />
+                  ))}
+                </tbody>
+              </table>
             </div>
-
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={() => fetchTickets()}
-                className="px-4 py-2 rounded-full text-sm font-medium border"
-                style={{
-                  borderColor: COLORS.cardBorder,
-                  color: COLORS.textSecondary,
-                  backgroundColor: COLORS.cardBg,
-                }}
-                disabled={loading}
-              >
-                {loading ? "Refreshing..." : "Refresh"}
-              </button>
-            </div>
-          </div>
+          )}
         </div>
-
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr
-                className="text-left"
-                style={{
-                  backgroundColor: COLORS.highlightCardBg,
-                  color: COLORS.textSecondary,
-                }}
-              >
-                <th className="px-5 py-3 font-medium">Ticket</th>
-                <th className="px-5 py-3 font-medium">Raffle</th>
-                <th className="px-5 py-3 font-medium">Customer</th>
-                <th className="px-5 py-3 font-medium">Status</th>
-                <th className="px-5 py-3 font-medium">Amount</th>
-                <th className="px-5 py-3 font-medium">When</th>
-                <th className="px-5 py-3 font-medium">Refs</th>
-              </tr>
-            </thead>
-
-            <tbody>
-              {loading ? (
-                <tr>
-                  <td
-                    className="px-5 py-6"
-                    colSpan={7}
-                    style={{ color: COLORS.textSecondary }}
-                  >
-                    Loading tickets...
-                  </td>
-                </tr>
-              ) : rows.length === 0 ? (
-                <tr>
-                  <td
-                    className="px-5 py-6"
-                    colSpan={7}
-                    style={{ color: COLORS.textSecondary }}
-                  >
-                    No tickets found for the selected filters.
-                  </td>
-                </tr>
-              ) : (
-                rows.map((t) => {
-                  const raffleName = t.raffles?.item_name ?? "—";
-                  const custEmail = t.customers?.email ?? "—";
-                  const created = t.created_at
-                    ? new Date(t.created_at).toLocaleString("en-IE")
-                    : "—";
-
-                  const statusLabel =
-                    t.payment_status === "completed"
-                      ? "Completed"
-                      : t.payment_status === "pending"
-                      ? "Pending"
-                      : t.payment_status === "failed"
-                      ? "Failed"
-                      : String(t.payment_status);
-
-                  const statusBg =
-                    t.payment_status === "completed"
-                      ? "#ECFDF5"
-                      : t.payment_status === "pending"
-                      ? "#FFFBEB"
-                      : t.payment_status === "failed"
-                      ? "#FEF2F2"
-                      : COLORS.highlightCardBg;
-
-                  const statusBorder =
-                    t.payment_status === "completed"
-                      ? "#6EE7B7"
-                      : t.payment_status === "pending"
-                      ? "#FCD34D"
-                      : t.payment_status === "failed"
-                      ? "#FCA5A5"
-                      : COLORS.cardBorder;
-
-                  const statusColor =
-                    t.payment_status === "failed"
-                      ? COLORS.error
-                      : COLORS.textPrimary;
-
-                  const ticketLabel = t.ticket_code
-                    ? t.ticket_code
-                    : t.ticket_number != null
-                    ? `#${t.ticket_number}`
-                    : "—";
-
-                  const subLabel =
-                    t.ticket_code && t.ticket_number != null
-                      ? `Legacy #: ${t.ticket_number}`
-                      : t.ticket_code
-                      ? "Ticket code"
-                      : "Ticket";
-
-                  return (
-                    <tr
-                      key={t.id}
-                      className="border-t"
-                      style={{ borderColor: COLORS.cardBorder }}
-                    >
-                      <td className="px-5 py-4">
-                        <div className="flex flex-col gap-1">
-                          <Link
-                            href={`/tickets/${t.id}`}
-                            className="font-semibold underline"
-                            style={{ color: COLORS.primary }}
-                          >
-                            {ticketLabel}
-                            {t.is_winner ? " • WINNER" : ""}
-                          </Link>
-
-                          <div
-                            className="text-xs"
-                            style={{ color: COLORS.textMuted }}
-                          >
-                            {subLabel}
-                          </div>
-
-                          <div
-                            className="text-xs"
-                            style={{ color: COLORS.textMuted }}
-                          >
-                            ID: {shortId(t.id)}
-                          </div>
-                        </div>
-                      </td>
-
-                      <td className="px-5 py-4">
-                        <div className="flex flex-col gap-1">
-                          <Link
-                            href={`/raffles/${t.raffle_id}`}
-                            className="underline"
-                            style={{ color: COLORS.primary }}
-                          >
-                            {raffleName}
-                          </Link>
-                          <div
-                            className="text-xs"
-                            style={{ color: COLORS.textMuted }}
-                          >
-                            {shortId(t.raffle_id)}
-                          </div>
-                        </div>
-                      </td>
-
-                      <td className="px-5 py-4">
-                        <div className="flex flex-col gap-1">
-                          <Link
-                            href={`/customers/${t.customer_id}`}
-                            className="underline"
-                            style={{ color: COLORS.primary }}
-                          >
-                            {custEmail}
-                          </Link>
-                          <div
-                            className="text-xs"
-                            style={{ color: COLORS.textMuted }}
-                          >
-                            {shortId(t.customer_id)}
-                          </div>
-                        </div>
-                      </td>
-
-                      <td className="px-5 py-4">
-                        <span
-                          className="inline-flex items-center px-2.5 py-1 rounded-full border text-xs font-medium"
-                          style={{
-                            backgroundColor: statusBg,
-                            borderColor: statusBorder,
-                            color: statusColor,
-                          }}
-                        >
-                          {statusLabel}
-                        </span>
-
-                        {t.payment_status === "failed" && t.payment_error ? (
-                          <div
-                            className="text-xs mt-1"
-                            style={{ color: COLORS.textMuted }}
-                          >
-                            {t.payment_error.slice(0, 80)}
-                            {t.payment_error.length > 80 ? "…" : ""}
-                          </div>
-                        ) : null}
-                      </td>
-
-                      <td
-                        className="px-5 py-4"
-                        style={{ color: COLORS.textPrimary }}
-                      >
-                        {formatMoney(t.payment_amount, t.payment_currency)}
-                        <div
-                          className="text-xs"
-                          style={{ color: COLORS.textMuted }}
-                        >
-                          Method: {t.payment_method ?? "—"}
-                        </div>
-                      </td>
-
-                      <td
-                        className="px-5 py-4"
-                        style={{ color: COLORS.textPrimary }}
-                      >
-                        {created}
-                        <div
-                          className="text-xs"
-                          style={{ color: COLORS.textMuted }}
-                        >
-                          Completed:{" "}
-                          {t.payment_completed_at
-                            ? new Date(t.payment_completed_at).toLocaleString(
-                                "en-IE"
-                              )
-                            : "—"}
-                        </div>
-                      </td>
-
-                      <td className="px-5 py-4">
-                        <div
-                          className="text-xs"
-                          style={{ color: COLORS.textMuted }}
-                        >
-                          PI: {shortId(t.payment_intent_id)}
-                        </div>
-                        <div
-                          className="text-xs"
-                          style={{ color: COLORS.textMuted }}
-                        >
-                          CS: {shortId(t.checkout_session_id)}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-
-        {/* Pagination */}
-        <div
-          className="flex items-center justify-between px-5 py-4 border-t"
-          style={{ borderColor: COLORS.cardBorder }}
-        >
-          <div className="text-sm" style={{ color: COLORS.textSecondary }}>
-            Showing {(page - 1) * PAGE_SIZE + 1}–
-            {Math.min(page * PAGE_SIZE, totalCount)} of{" "}
-            {totalCount.toLocaleString()}
-          </div>
-
-          <div className="flex gap-2">
-            <button
-              type="button"
-              className="px-4 py-2 rounded-full text-sm font-medium border"
-              style={{
-                borderColor: COLORS.cardBorder,
-                color: COLORS.textSecondary,
-                backgroundColor: COLORS.cardBg,
-                opacity: page <= 1 ? 0.5 : 1,
-              }}
-              disabled={page <= 1 || loading}
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
-            >
-              Prev
-            </button>
-            <button
-              type="button"
-              className="px-4 py-2 rounded-full text-sm font-medium"
-              style={{
-                backgroundColor: COLORS.primaryButtonBg,
-                color: COLORS.primaryButtonText,
-                opacity: page >= totalPages ? 0.5 : 1,
-              }}
-              disabled={page >= totalPages || loading}
-              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-            >
-              Next
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Notes */}
-      <div
-        className="rounded-2xl p-5 border text-sm"
-        style={{
-          backgroundColor: COLORS.highlightCardBg,
-          borderColor: COLORS.cardBorder,
-          color: COLORS.textSecondary,
-        }}
-      >
-        <div
-          className="font-semibold mb-2"
-          style={{ color: COLORS.textPrimary }}
-        >
-          Notes
-        </div>
-        <ul className="list-disc pl-5 space-y-1">
-          <li>Ticket code is the primary identifier (global unique).</li>
-          <li>Legacy ticket number is still displayed where it exists.</li>
-          <li>Nested relations are normalized (object/array/null safe).</li>
-          <li>
-            Realtime refresh triggers on any tickets insert/update/delete.
-          </li>
-        </ul>
-      </div>
+      )}
     </div>
+  );
+}
+
+function StatusFilterButton({
+  label,
+  value,
+  activeValue,
+  onClick,
+}: {
+  label: string;
+  value: StatusFilter;
+  activeValue: StatusFilter;
+  onClick: (v: StatusFilter) => void;
+}) {
+  const isActive = value === activeValue;
+
+  return (
+    <button
+      type="button"
+      onClick={() => onClick(value)}
+      className="px-3 py-1.5 rounded-full text-[0.75rem] font-medium border transition-colors"
+      style={{
+        backgroundColor: isActive ? COLORS.tabActiveBg : COLORS.tabBg,
+        color: isActive ? COLORS.tabActiveTint : COLORS.tabInactiveTint,
+        borderColor: COLORS.tabBorder,
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+function Th({
+  children,
+  className = "",
+}: {
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <th
+      className={`px-4 py-3 text-left text-[0.7rem] font-semibold uppercase tracking-wide ${className}`}
+    >
+      {children}
+    </th>
+  );
+}
+
+function RaffleRowItem({
+  raffle,
+  striped,
+}: {
+  raffle: RaffleRow;
+  striped: boolean;
+}) {
+  const sold = raffle.sold_tickets ?? 0;
+  const total = raffle.total_tickets;
+  const soldPercent = total > 0 ? Math.round((sold / total) * 100) : 0;
+
+  const price =
+    typeof raffle.ticket_price === "number"
+      ? raffle.ticket_price
+      : Number(raffle.ticket_price);
+
+  const thumbSrc = raffle.item_image_url || "/vercel.svg";
+
+  return (
+    <tr
+      className="border-t transition-colors hover:bg-gray-50"
+      style={{
+        borderColor: COLORS.cardBorder,
+        backgroundColor: striped ? "#FAFAF9" : COLORS.cardBg,
+      }}
+    >
+      {/* Item */}
+      <td className="px-4 py-3 align-top">
+        <Link href={`/raffles/${raffle.id}`} className="block">
+          <div className="flex items-start gap-3">
+            {/* Thumbnail frame (no crop, no overflow) */}
+            <div
+              className="flex-shrink-0 rounded-lg border overflow-hidden"
+              style={{
+                width: 56,
+                height: 56,
+                borderColor: COLORS.cardBorder,
+                backgroundColor: COLORS.highlightCardBg,
+              }}
+            >
+              <div className="relative w-full h-full">
+                <Image
+                  src={thumbSrc}
+                  alt={raffle.item_name}
+                  fill
+                  className="object-contain"
+                  sizes="56px"
+                />
+              </div>
+            </div>
+
+            <div className="min-w-0">
+              <div
+                className="font-medium hover:underline truncate"
+                style={{ color: COLORS.textPrimary }}
+                title={raffle.item_name}
+              >
+                {raffle.item_name}
+              </div>
+              <div
+                className="text-[0.7rem] mt-1 truncate"
+                style={{ color: COLORS.textSecondary }}
+                title={raffle.id}
+              >
+                ID: {raffle.id}
+              </div>
+            </div>
+          </div>
+        </Link>
+      </td>
+
+      {/* Status */}
+      <td className="px-4 py-3 align-top">
+        <StatusBadge status={raffle.status} />
+      </td>
+
+      {/* Ticket price */}
+      <td className="px-4 py-3 align-top text-right">
+        <span style={{ color: COLORS.textPrimary }}>
+          {Number.isFinite(price) ? `€${price.toFixed(2)}` : "-"}
+        </span>
+      </td>
+
+      {/* Tickets */}
+      <td className="px-4 py-3 align-top text-right">
+        <span style={{ color: COLORS.textPrimary }}>
+          {sold} / {total}
+        </span>
+      </td>
+
+      {/* Sold % + mini bar */}
+      <td className="px-4 py-3 align-top text-right">
+        <div className="text-xs mb-1" style={{ color: COLORS.textSecondary }}>
+          {soldPercent}%
+        </div>
+        <div
+          className="w-full h-2 rounded-full overflow-hidden"
+          style={{ backgroundColor: COLORS.raffleRemaining }}
+        >
+          <div
+            className="h-2 rounded-full"
+            style={{
+              width: `${soldPercent}%`,
+              backgroundColor: COLORS.raffleSoldProgress,
+            }}
+          />
+        </div>
+      </td>
+
+      {/* Max per customer */}
+      <td className="px-4 py-3 align-top text-right">
+        <span style={{ color: COLORS.textPrimary }}>
+          {raffle.max_tickets_per_customer ?? 3}
+        </span>
+      </td>
+
+      {/* Draw date */}
+      <td className="px-4 py-3 align-top">
+        <span style={{ color: COLORS.textSecondary, fontSize: "0.75rem" }}>
+          {raffle.draw_date
+            ? new Date(raffle.draw_date).toLocaleString("en-IE")
+            : "Not set"}
+        </span>
+      </td>
+
+      {/* Created */}
+      <td className="px-4 py-3 align-top">
+        <span style={{ color: COLORS.textSecondary, fontSize: "0.75rem" }}>
+          {new Date(raffle.created_at).toLocaleString("en-IE")}
+        </span>
+      </td>
+    </tr>
+  );
+}
+
+function StatusBadge({ status }: { status: RaffleStatus }) {
+  let bg = COLORS.info;
+  let label: string = status;
+
+  if (status === "active") {
+    bg = COLORS.success;
+    label = "Active";
+  } else if (status === "soldout") {
+    bg = COLORS.warning;
+    label = "Sold out";
+  } else if (status === "drawn") {
+    bg = COLORS.primary;
+    label = "Drawn";
+  } else if (status === "cancelled") {
+    bg = COLORS.error;
+    label = "Cancelled";
+  }
+
+  return (
+    <span
+      className="text-xs font-semibold px-2 py-1 rounded-full"
+      style={{ backgroundColor: bg, color: COLORS.textOnPrimary }}
+    >
+      {label}
+    </span>
   );
 }

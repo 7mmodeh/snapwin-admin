@@ -14,7 +14,12 @@ import Image from "next/image";
 import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
-import type { RealtimeChannel } from "@supabase/supabase-js";
+import type {
+  PostgrestError,
+  RealtimeChannel,
+  PostgrestSingleResponse,
+  PostgrestResponse,
+} from "@supabase/supabase-js";
 
 const BUCKET_NAME = "raffle-images";
 
@@ -38,14 +43,14 @@ type RaffleDetail = {
 
 type TicketRow = {
   id: string;
-  ticket_code: string | null; // ✅ migration-safe
+  ticket_code: string | null; // ✅ latest model
   ticket_number: number;
   customer_id: string;
-  payment_status: "pending" | "completed" | "failed";
-  is_winner: boolean;
+  payment_status: "pending" | "completed" | "failed" | string;
+  is_winner: boolean | null;
   purchased_at: string | null;
   created_at: string | null;
-  payment_amount: string | number | null;
+  payment_amount: number | null; // ✅ normalize to number for UI/math/export
 };
 
 type WinnerCustomer = {
@@ -66,7 +71,8 @@ const RAFFLE_SELECT =
   "id, item_name, item_description, status, total_tickets, sold_tickets, ticket_price, draw_date, winner_id, winning_ticket_id, winning_ticket_number, item_image_url, created_at, updated_at, max_tickets_per_customer";
 
 const TICKETS_SELECT =
-  "id, ticket_code, ticket_number, customer_id, payment_status, is_winner, purchased_at, created_at, payment_amount";
+  // include raffle_id only for query correctness / future use (doesn't change UI)
+  "id, raffle_id, ticket_code, ticket_number, customer_id, payment_status, is_winner, purchased_at, created_at, payment_amount";
 
 function isDrawWinnerRpcResult(v: unknown): v is DrawWinnerRpcResult {
   if (typeof v !== "object" || v === null) return false;
@@ -84,6 +90,23 @@ function isDrawWinnerRpcResult(v: unknown): v is DrawWinnerRpcResult {
     typeof o.winning_ticket_number === "number" ||
     o.winning_ticket_number === undefined;
   return okWinner && okTicketId && okTicketNum;
+}
+
+function toPostgrestError(err: unknown): PostgrestError | null {
+  if (!err || typeof err !== "object") return null;
+  const e = err as Partial<PostgrestError>;
+  if (typeof e.message === "string") return e as PostgrestError;
+  return null;
+}
+
+function coerceNumber(v: unknown): number | null {
+  if (v == null) return null;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "string") {
+    const n = parseFloat(v);
+    return Number.isNaN(n) ? null : n;
+  }
+  return null;
 }
 
 export default function RaffleDetailPage() {
@@ -124,49 +147,80 @@ export default function RaffleDetailPage() {
   }, [imagePreview]);
 
   const realtimeRefreshTimerRef = useRef<number | null>(null);
-  const scheduleRefresh = useCallback(() => {
+  const clearRealtimeTimer = useCallback(() => {
     if (realtimeRefreshTimerRef.current) {
       window.clearTimeout(realtimeRefreshTimerRef.current);
+      realtimeRefreshTimerRef.current = null;
     }
-    realtimeRefreshTimerRef.current = window.setTimeout(() => {
-      fetchDetail();
-    }, 350);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const fetchDetail = useCallback(async () => {
     try {
       if (!raffleId) return;
+
       setLoading(true);
       setError(null);
       setSuccess(null);
 
-      const [raffleRes, ticketsRes] = await Promise.all([
-        supabase
-          .from("raffles")
-          .select(RAFFLE_SELECT)
-          .eq("id", raffleId)
-          .maybeSingle<RaffleDetail>(),
-        supabase
-          .from("tickets")
-          .select<string, TicketRow>(TICKETS_SELECT)
-          .eq("raffle_id", raffleId)
-          .order("created_at", { ascending: true }),
-      ]);
+      const raffleReq = supabase
+        .from("raffles")
+        .select(RAFFLE_SELECT)
+        .eq("id", raffleId)
+        .maybeSingle();
+
+      const ticketsReq = supabase
+        .from("tickets")
+        .select(TICKETS_SELECT)
+        .eq("raffle_id", raffleId)
+        .order("created_at", { ascending: true });
+
+      const [raffleRes, ticketsRes] = (await Promise.all([
+        raffleReq,
+        ticketsReq,
+      ])) as [PostgrestSingleResponse<unknown>, PostgrestResponse<unknown>];
 
       if (raffleRes.error) throw raffleRes.error;
       if (!raffleRes.data) {
         setError("Raffle not found.");
-        setLoading(false);
+        setRaffle(null);
+        setTickets([]);
+        setWinner(null);
         return;
       }
+
       if (ticketsRes.error) throw ticketsRes.error;
 
-      const raffleData = raffleRes.data;
-      const ticketsData = ticketsRes.data ?? [];
+      const raffleData = raffleRes.data as RaffleDetail;
+
+      const rawTickets: unknown = ticketsRes.data ?? [];
+      const ticketsArray: unknown[] = Array.isArray(rawTickets)
+        ? rawTickets
+        : [];
+
+      const normalizedTickets: TicketRow[] = ticketsArray.map((t) => {
+        const o = (t ?? {}) as Record<string, unknown>;
+        return {
+          id: String(o.id ?? ""),
+          ticket_code:
+            o.ticket_code == null ? null : String(o.ticket_code ?? null),
+          ticket_number:
+            typeof o.ticket_number === "number"
+              ? o.ticket_number
+              : parseInt(String(o.ticket_number ?? "0"), 10) || 0,
+          customer_id: String(o.customer_id ?? ""),
+          payment_status: String(o.payment_status ?? ""),
+          is_winner:
+            typeof o.is_winner === "boolean"
+              ? o.is_winner
+              : (o.is_winner as boolean | null) ?? null,
+          purchased_at: o.purchased_at == null ? null : String(o.purchased_at),
+          created_at: o.created_at == null ? null : String(o.created_at),
+          payment_amount: coerceNumber(o.payment_amount),
+        };
+      });
 
       setRaffle(raffleData);
-      setTickets(ticketsData);
+      setTickets(normalizedTickets);
 
       setItemNameDraft(raffleData.item_name);
       setItemDescriptionDraft(raffleData.item_description);
@@ -192,22 +246,36 @@ export default function RaffleDetailPage() {
           .from("customers")
           .select("id, name, email, phone, county")
           .eq("id", raffleData.winner_id)
-          .maybeSingle<WinnerCustomer>();
+          .maybeSingle();
 
-        if (!winnerRes.error && winnerRes.data) setWinner(winnerRes.data);
-        else setWinner(null);
+        if (!winnerRes.error && winnerRes.data) {
+          setWinner(winnerRes.data as WinnerCustomer);
+        } else {
+          setWinner(null);
+        }
       } else {
         setWinner(null);
       }
     } catch (err: unknown) {
       console.error("Error loading raffle detail:", err);
+      const pe = toPostgrestError(err);
       setError(
-        err instanceof Error ? err.message : "Failed to load raffle details."
+        pe?.message ??
+          (err instanceof Error
+            ? err.message
+            : "Failed to load raffle details.")
       );
     } finally {
       setLoading(false);
     }
   }, [raffleId]);
+
+  const scheduleRefresh = useCallback(() => {
+    clearRealtimeTimer();
+    realtimeRefreshTimerRef.current = window.setTimeout(() => {
+      fetchDetail();
+    }, 350);
+  }, [clearRealtimeTimer, fetchDetail]);
 
   useEffect(() => {
     fetchDetail();
@@ -215,13 +283,6 @@ export default function RaffleDetailPage() {
 
   useEffect(() => {
     if (!raffleId) return;
-
-    const clearTimer = () => {
-      if (realtimeRefreshTimerRef.current) {
-        window.clearTimeout(realtimeRefreshTimerRef.current);
-        realtimeRefreshTimerRef.current = null;
-      }
-    };
 
     const ticketsChannel: RealtimeChannel = supabase
       .channel(`admin-raffle-${raffleId}-tickets`)
@@ -252,11 +313,11 @@ export default function RaffleDetailPage() {
       .subscribe();
 
     return () => {
-      clearTimer();
+      clearRealtimeTimer();
       supabase.removeChannel(ticketsChannel);
       supabase.removeChannel(rafflesChannel);
     };
-  }, [raffleId, scheduleRefresh]);
+  }, [raffleId, scheduleRefresh, clearRealtimeTimer]);
 
   const stats = useMemo(() => {
     if (!raffle) {
@@ -392,7 +453,11 @@ export default function RaffleDetailPage() {
       setSuccess("Raffle updated successfully.");
     } catch (err: unknown) {
       console.error("Error updating raffle:", err);
-      setError(err instanceof Error ? err.message : "Failed to update raffle.");
+      const pe = toPostgrestError(err);
+      setError(
+        pe?.message ??
+          (err instanceof Error ? err.message : "Failed to update raffle.")
+      );
     } finally {
       setSaving(false);
     }
@@ -416,10 +481,10 @@ export default function RaffleDetailPage() {
 
       const parsed: DrawWinnerRpcResult | null = Array.isArray(raw)
         ? raw.length && isDrawWinnerRpcResult(raw[0])
-          ? raw[0]
+          ? (raw[0] as DrawWinnerRpcResult)
           : null
         : isDrawWinnerRpcResult(raw)
-        ? raw
+        ? (raw as DrawWinnerRpcResult)
         : null;
 
       if (!parsed) {
@@ -449,22 +514,52 @@ export default function RaffleDetailPage() {
           .from("customers")
           .select("id, name, email, phone, county")
           .eq("id", nextWinnerId)
-          .maybeSingle<WinnerCustomer>();
+          .maybeSingle();
 
-        if (!winnerRes.error && winnerRes.data) setWinner(winnerRes.data);
-        else setWinner(null);
+        if (!winnerRes.error && winnerRes.data) {
+          setWinner(winnerRes.data as WinnerCustomer);
+        } else {
+          setWinner(null);
+        }
       } else {
         setWinner(null);
       }
 
+      // refresh tickets (avoid generic .select<...> typing issues)
       const ticketsRes = await supabase
         .from("tickets")
-        .select<string, TicketRow>(TICKETS_SELECT)
+        .select(TICKETS_SELECT)
         .eq("raffle_id", raffleId)
         .order("created_at", { ascending: true });
 
       if (ticketsRes.error) throw ticketsRes.error;
-      setTickets(ticketsRes.data ?? []);
+
+      const rawTickets: unknown = ticketsRes.data ?? [];
+      const ticketsArray: unknown[] = Array.isArray(rawTickets)
+        ? rawTickets
+        : [];
+      const normalizedTickets: TicketRow[] = ticketsArray.map((t) => {
+        const o = (t ?? {}) as Record<string, unknown>;
+        return {
+          id: String(o.id ?? ""),
+          ticket_code: o.ticket_code == null ? null : String(o.ticket_code),
+          ticket_number:
+            typeof o.ticket_number === "number"
+              ? o.ticket_number
+              : parseInt(String(o.ticket_number ?? "0"), 10) || 0,
+          customer_id: String(o.customer_id ?? ""),
+          payment_status: String(o.payment_status ?? ""),
+          is_winner:
+            typeof o.is_winner === "boolean"
+              ? o.is_winner
+              : (o.is_winner as boolean | null) ?? null,
+          purchased_at: o.purchased_at == null ? null : String(o.purchased_at),
+          created_at: o.created_at == null ? null : String(o.created_at),
+          payment_amount: coerceNumber(o.payment_amount),
+        };
+      });
+
+      setTickets(normalizedTickets);
 
       setSuccess(
         nextWinningTicketNumber != null
@@ -473,7 +568,11 @@ export default function RaffleDetailPage() {
       );
     } catch (err: unknown) {
       console.error("Error drawing winner:", err);
-      setError(err instanceof Error ? err.message : "Failed to draw winner.");
+      const pe = toPostgrestError(err);
+      setError(
+        pe?.message ??
+          (err instanceof Error ? err.message : "Failed to draw winner.")
+      );
     } finally {
       setDrawing(false);
     }
@@ -538,8 +637,10 @@ export default function RaffleDetailPage() {
       setSuccess("Raffle image updated successfully.");
     } catch (err: unknown) {
       console.error("Error uploading new image:", err);
+      const pe = toPostgrestError(err);
       setError(
-        err instanceof Error ? err.message : "Failed to upload new image."
+        pe?.message ??
+          (err instanceof Error ? err.message : "Failed to upload new image.")
       );
     } finally {
       setImageSaving(false);
@@ -1252,7 +1353,7 @@ function TicketStatusBadge({
   status: TicketRow["payment_status"];
 }) {
   let bg = COLORS.info;
-  let label: string = status;
+  let label: string = String(status ?? "");
 
   if (status === "completed") {
     bg = COLORS.success;
@@ -1288,8 +1389,7 @@ function toDateTimeLocalValue(isoString: string): string {
   return `${year}-${month}-${day}T${hours}:${minutes}`;
 }
 
-function formatAmount(amount: string | number): string {
-  const num = typeof amount === "number" ? amount : parseFloat(amount);
-  if (Number.isNaN(num)) return "-";
-  return num.toFixed(2);
+function formatAmount(amount: number): string {
+  if (!Number.isFinite(amount)) return "-";
+  return amount.toFixed(2);
 }

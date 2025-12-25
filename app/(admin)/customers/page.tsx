@@ -1,8 +1,9 @@
 // app/(admin)/customers/page.tsx
 "use client";
 
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import Link from "next/link";
+import type { RealtimeChannel, PostgrestError } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
 
@@ -15,55 +16,152 @@ type CustomerRow = {
   created_at: string;
 };
 
+/**
+ * Raw shape from Supabase (unknown-safe).
+ * We normalize this to CustomerRow with runtime guards.
+ */
+type CustomerRowRaw = {
+  id?: unknown;
+  name?: unknown;
+  email?: unknown;
+  phone?: unknown;
+  county?: unknown;
+  created_at?: unknown;
+};
+
+function toStringOrEmpty(v: unknown): string {
+  if (v == null) return "";
+  return typeof v === "string" ? v : String(v);
+}
+
+function normalizeCustomerRow(raw: CustomerRowRaw): CustomerRow | null {
+  const id = typeof raw.id === "string" ? raw.id : null;
+  const name = typeof raw.name === "string" ? raw.name : null;
+  const email = typeof raw.email === "string" ? raw.email : null;
+  const created_at = typeof raw.created_at === "string" ? raw.created_at : null;
+
+  if (!id || !name || !email || !created_at) return null;
+
+  return {
+    id,
+    name,
+    email,
+    phone: toStringOrEmpty(raw.phone),
+    county: toStringOrEmpty(raw.county),
+    created_at,
+  };
+}
+
+function toErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === "object") {
+    const pe = err as Partial<PostgrestError>;
+    if (typeof pe.message === "string" && pe.message.trim()) return pe.message;
+  }
+  return "Failed to load customers.";
+}
+
 export default function CustomersPage() {
   const [customers, setCustomers] = useState<CustomerRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Search (debounced to avoid re-render spam on big lists)
   const [search, setSearch] = useState("");
-
+  const searchTimerRef = useRef<number | null>(null);
+  const [searchDebounced, setSearchDebounced] = useState("");
   useEffect(() => {
-    const fetchCustomers = async () => {
-      try {
-        setLoading(true);
-        setError(null);
-
-        const { data, error } = await supabase
-          .from("customers")
-          .select("id, name, email, phone, county, created_at")
-          .order("created_at", { ascending: false });
-
-        if (error) throw error;
-
-        setCustomers((data ?? []) as CustomerRow[]);
-      } catch (err: unknown) {
-        console.error("Error loading customers:", err);
-        if (err instanceof Error) {
-          setError(err.message);
-        } else {
-          setError("Failed to load customers.");
-        }
-      } finally {
-        setLoading(false);
-      }
+    if (searchTimerRef.current) window.clearTimeout(searchTimerRef.current);
+    searchTimerRef.current = window.setTimeout(
+      () => setSearchDebounced(search.trim().toLowerCase()),
+      200
+    );
+    return () => {
+      if (searchTimerRef.current) window.clearTimeout(searchTimerRef.current);
     };
+  }, [search]);
 
-    fetchCustomers();
+  // Realtime throttle (bursty updates)
+  const rtTimerRef = useRef<number | null>(null);
+
+  const fetchCustomers = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError(null);
+
+      const { data, error: qErr } = await supabase
+        .from("customers")
+        .select("id, name, email, phone, county, created_at")
+        .order("created_at", { ascending: false });
+
+      if (qErr) throw qErr;
+
+      const rawList: CustomerRowRaw[] = Array.isArray(data)
+        ? (data as unknown as CustomerRowRaw[])
+        : [];
+
+      const normalized: CustomerRow[] = [];
+      for (const r of rawList) {
+        const n = normalizeCustomerRow(r);
+        if (n) normalized.push(n);
+      }
+
+      setCustomers(normalized);
+    } catch (err: unknown) {
+      console.error("Error loading customers:", err);
+      setError(toErrorMessage(err));
+      setCustomers([]);
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  const normalizedSearch = search.trim().toLowerCase();
+  useEffect(() => {
+    fetchCustomers();
+  }, [fetchCustomers]);
+
+  // Optional realtime refresh (keeps admin lists consistent)
+  useEffect(() => {
+    const scheduleRefresh = () => {
+      if (rtTimerRef.current) window.clearTimeout(rtTimerRef.current);
+      rtTimerRef.current = window.setTimeout(() => {
+        fetchCustomers();
+      }, 300);
+    };
+
+    const channel: RealtimeChannel = supabase
+      .channel("admin_customers_live")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "customers" },
+        () => scheduleRefresh()
+      )
+      .subscribe();
+
+    return () => {
+      if (rtTimerRef.current) window.clearTimeout(rtTimerRef.current);
+      supabase.removeChannel(channel);
+    };
+  }, [fetchCustomers]);
 
   const filtered = useMemo(() => {
-    if (!normalizedSearch) return customers;
+    const s = searchDebounced;
+    if (!s) return customers;
 
     return customers.filter((c) => {
+      const name = c.name.toLowerCase();
+      const email = c.email.toLowerCase();
+      const phone = (c.phone || "").toLowerCase();
+      const county = (c.county || "").toLowerCase();
+
       return (
-        c.name.toLowerCase().includes(normalizedSearch) ||
-        c.email.toLowerCase().includes(normalizedSearch) ||
-        c.phone.toLowerCase().includes(normalizedSearch) ||
-        c.county.toLowerCase().includes(normalizedSearch)
+        name.includes(s) ||
+        email.includes(s) ||
+        phone.includes(s) ||
+        county.includes(s)
       );
     });
-  }, [customers, normalizedSearch]);
+  }, [customers, searchDebounced]);
 
   return (
     <div className="space-y-6">
@@ -109,6 +207,7 @@ export default function CustomersPage() {
                 onClick={() => setSearch("")}
                 className="absolute right-3 top-1/2 -translate-y-1/2 text-xs"
                 style={{ color: COLORS.textMuted }}
+                aria-label="Clear search"
               >
                 ✕
               </button>
@@ -123,7 +222,7 @@ export default function CustomersPage() {
                 {customers.length}
               </strong>
             </span>
-            {normalizedSearch && (
+            {searchDebounced && (
               <span style={{ color: COLORS.textSecondary }}>
                 · Matching:{" "}
                 <strong style={{ color: COLORS.textPrimary }}>
@@ -276,10 +375,14 @@ function CustomerRowItem({
         <span style={{ color: COLORS.textPrimary }}>{customer.email}</span>
       </td>
       <td className="px-4 py-3 align-top">
-        <span style={{ color: COLORS.textSecondary }}>{customer.phone}</span>
+        <span style={{ color: COLORS.textSecondary }}>
+          {customer.phone || "-"}
+        </span>
       </td>
       <td className="px-4 py-3 align-top">
-        <span style={{ color: COLORS.textSecondary }}>{customer.county}</span>
+        <span style={{ color: COLORS.textSecondary }}>
+          {customer.county || "-"}
+        </span>
       </td>
       <td className="px-4 py-3 align-top">
         <span style={{ color: COLORS.textSecondary, fontSize: "0.75rem" }}>

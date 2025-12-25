@@ -15,7 +15,7 @@ type QuestionRow = {
   option_a: string;
   option_b: string;
   option_c: string;
-  correct_answer: string; // DB is text, we normalize to "a" | "b" | "c" in UI
+  correct_answer: string; // DB is text; UI normalizes to "a" | "b" | "c"
   order: number;
   created_at?: string | null;
 };
@@ -24,6 +24,26 @@ type RaffleSummary = {
   id: string;
   item_name: string;
 };
+
+/**
+ * Small runtime guard/normalizer for correct_answer.
+ * Keeps UI safe even if DB has unexpected values.
+ */
+function normalizeCorrectAnswer(v: unknown): CorrectAnswer {
+  return v === "b" ? "b" : v === "c" ? "c" : "a";
+}
+
+function normalizeQuestionRow(raw: QuestionRow): QuestionRow {
+  // Ensure the DB value stays in a safe subset; keep DB field as string
+  return {
+    ...raw,
+    correct_answer: normalizeCorrectAnswer(raw.correct_answer),
+    order: Number.isFinite(raw.order) ? raw.order : 0,
+  };
+}
+
+const QUESTIONS_SELECT =
+  'id, raffle_id, question_text, option_a, option_b, option_c, correct_answer, "order", created_at';
 
 export default function RaffleQuestionsPage() {
   const params = useParams();
@@ -72,11 +92,10 @@ export default function RaffleQuestionsPage() {
             .maybeSingle<RaffleSummary>(),
           supabase
             .from("questions")
-            .select(
-              'id, raffle_id, question_text, option_a, option_b, option_c, correct_answer, "order", created_at'
-            )
+            .select(QUESTIONS_SELECT)
             .eq("raffle_id", raffleId)
-            .order("order", { ascending: true }),
+            .order("order", { ascending: true })
+            .returns<QuestionRow[]>(),
         ]);
 
         if (raffleRes.error) throw raffleRes.error;
@@ -87,15 +106,16 @@ export default function RaffleQuestionsPage() {
         }
         if (questionsRes.error) throw questionsRes.error;
 
+        const rawQs = questionsRes.data ?? [];
+        const normalizedQs = rawQs.map(normalizeQuestionRow);
+
         setRaffle(raffleRes.data);
-        setQuestions((questionsRes.data ?? []) as QuestionRow[]);
+        setQuestions(normalizedQs);
       } catch (err: unknown) {
         console.error("Error loading questions:", err);
-        if (err instanceof Error) {
-          setError(err.message);
-        } else {
-          setError("Failed to load questions.");
-        }
+        setError(
+          err instanceof Error ? err.message : "Failed to load questions."
+        );
       } finally {
         setLoading(false);
       }
@@ -131,13 +151,12 @@ export default function RaffleQuestionsPage() {
       setSuccess(null);
 
       // Determine next "order" (NOT NULL, > 0)
-      const maxOrder = questions.reduce(
-        (max, q) => (q.order && q.order > max ? q.order : max),
-        0
-      );
+      const maxOrder = questions.reduce((max, q) => {
+        return q.order > max ? q.order : max;
+      }, 0);
       const nextOrder = maxOrder + 1;
 
-      const { data, error } = await supabase
+      const insertRes = await supabase
         .from("questions")
         .insert({
           raffle_id: raffleId,
@@ -148,23 +167,21 @@ export default function RaffleQuestionsPage() {
           correct_answer: newCorrect,
           order: nextOrder,
         })
-        .select(
-          'id, raffle_id, question_text, option_a, option_b, option_c, correct_answer, "order", created_at'
-        )
+        .select(QUESTIONS_SELECT)
         .single<QuestionRow>();
 
-      if (error) throw error;
+      if (insertRes.error) throw insertRes.error;
 
-      setQuestions((prev) => [...prev, data]);
+      const inserted = normalizeQuestionRow(insertRes.data);
+
+      setQuestions((prev) =>
+        [...prev, inserted].sort((a, b) => a.order - b.order)
+      );
       resetNewForm();
       setSuccess("Question added.");
     } catch (err: unknown) {
       console.error("Error adding question:", err);
-      if (err instanceof Error) {
-        setError(err.message);
-      } else {
-        setError("Failed to add question.");
-      }
+      setError(err instanceof Error ? err.message : "Failed to add question.");
     } finally {
       setSavingNew(false);
     }
@@ -176,11 +193,7 @@ export default function RaffleQuestionsPage() {
     setEditOptionA(q.option_a);
     setEditOptionB(q.option_b);
     setEditOptionC(q.option_c);
-
-    const normalizedCorrect: CorrectAnswer =
-      q.correct_answer === "b" ? "b" : q.correct_answer === "c" ? "c" : "a";
-
-    setEditCorrect(normalizedCorrect);
+    setEditCorrect(normalizeCorrectAnswer(q.correct_answer));
     setError(null);
     setSuccess(null);
   };
@@ -212,7 +225,7 @@ export default function RaffleQuestionsPage() {
       setError(null);
       setSuccess(null);
 
-      const { error } = await supabase
+      const updateRes = await supabase
         .from("questions")
         .update({
           question_text: trimmedQuestion,
@@ -223,32 +236,33 @@ export default function RaffleQuestionsPage() {
         })
         .eq("id", editingId);
 
-      if (error) throw error;
+      if (updateRes.error) throw updateRes.error;
 
       setQuestions((prev) =>
-        prev.map((q) =>
-          q.id === editingId
-            ? {
-                ...q,
-                question_text: trimmedQuestion,
-                option_a: editOptionA.trim(),
-                option_b: editOptionB.trim(),
-                option_c: editOptionC.trim(),
-                correct_answer: editCorrect,
-              }
-            : q
-        )
+        prev
+          .map((q) =>
+            q.id === editingId
+              ? {
+                  ...q,
+                  question_text: trimmedQuestion,
+                  option_a: editOptionA.trim(),
+                  option_b: editOptionB.trim(),
+                  option_c: editOptionC.trim(),
+                  correct_answer: editCorrect,
+                }
+              : q
+          )
+          .map(normalizeQuestionRow)
+          .sort((a, b) => a.order - b.order)
       );
 
       setSuccess("Question updated.");
       cancelEdit();
     } catch (err: unknown) {
       console.error("Error updating question:", err);
-      if (err instanceof Error) {
-        setError(err.message);
-      } else {
-        setError("Failed to update question.");
-      }
+      setError(
+        err instanceof Error ? err.message : "Failed to update question."
+      );
     } finally {
       setSavingEdit(false);
     }
@@ -264,22 +278,18 @@ export default function RaffleQuestionsPage() {
       setError(null);
       setSuccess(null);
 
-      const { error } = await supabase.from("questions").delete().eq("id", id);
+      const delRes = await supabase.from("questions").delete().eq("id", id);
 
-      if (error) throw error;
+      if (delRes.error) throw delRes.error;
 
       setQuestions((prev) => prev.filter((q) => q.id !== id));
-      if (editingId === id) {
-        cancelEdit();
-      }
+      if (editingId === id) cancelEdit();
       setSuccess("Question deleted.");
     } catch (err: unknown) {
       console.error("Error deleting question:", err);
-      if (err instanceof Error) {
-        setError(err.message);
-      } else {
-        setError("Failed to delete question.");
-      }
+      setError(
+        err instanceof Error ? err.message : "Failed to delete question."
+      );
     }
   };
 
@@ -401,12 +411,8 @@ export default function RaffleQuestionsPage() {
               .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
               .map((q, idx) => {
                 const isEditing = editingId === q.id;
-                const correct =
-                  q.correct_answer === "b"
-                    ? "B"
-                    : q.correct_answer === "c"
-                    ? "C"
-                    : "A";
+                const ca = normalizeCorrectAnswer(q.correct_answer);
+                const correct = ca === "b" ? "B" : ca === "c" ? "C" : "A";
 
                 return (
                   <li
@@ -425,6 +431,7 @@ export default function RaffleQuestionsPage() {
                         >
                           {idx + 1}
                         </span>
+
                         {!isEditing ? (
                           <span
                             className="font-medium"
@@ -455,17 +462,17 @@ export default function RaffleQuestionsPage() {
                             <OptionP
                               label="A"
                               value={q.option_a}
-                              isCorrect={q.correct_answer === "a"}
+                              isCorrect={ca === "a"}
                             />
                             <OptionP
                               label="B"
                               value={q.option_b}
-                              isCorrect={q.correct_answer === "b"}
+                              isCorrect={ca === "b"}
                             />
                             <OptionP
                               label="C"
                               value={q.option_c}
-                              isCorrect={q.correct_answer === "c"}
+                              isCorrect={ca === "c"}
                             />
                           </>
                         ) : (
@@ -511,7 +518,9 @@ export default function RaffleQuestionsPage() {
                             <select
                               value={editCorrect}
                               onChange={(e) =>
-                                setEditCorrect(e.target.value as CorrectAnswer)
+                                setEditCorrect(
+                                  normalizeCorrectAnswer(e.target.value)
+                                )
                               }
                               className="border rounded px-2 py-1 text-xs"
                               style={{

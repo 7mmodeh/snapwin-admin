@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { PostgrestError, RealtimeChannel } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
 
@@ -88,6 +89,15 @@ function isStatusFilter(v: string): v is StatusFilter {
   return v === "all" || v === "pending" || v === "completed" || v === "failed";
 }
 
+/**
+ * Escapes user input used inside ilike patterns.
+ * - % and _ are wildcards in LIKE/ILIKE
+ * - backslash is the escape char
+ */
+function escapeIlike(input: string) {
+  return input.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+}
+
 export default function AdminTicketsPage() {
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -168,23 +178,34 @@ export default function AdminTicketsPage() {
       // Ticket-side search only (safe / reliable)
       const search = qDebounced;
       if (search) {
+        // Avoid LIKE wildcard surprises and keep queries consistent
+        const s = escapeIlike(search);
+
         query = query.or(
           [
-            `ticket_code.ilike.%${search}%`,
-            `checkout_session_id.ilike.%${search}%`,
-            `payment_intent_id.ilike.%${search}%`,
+            `ticket_code.ilike.%${s}%`,
+            `checkout_session_id.ilike.%${s}%`,
+            `payment_intent_id.ilike.%${s}%`,
           ].join(",")
         );
       }
 
-      // IMPORTANT: strongly type the response to avoid `any` and array-vs-object mismatch issues.
-      const { data, error, count } = await query
-        .range(from, to)
-        .returns<TicketRowRaw[]>();
+      // Fetch and then normalize types explicitly (prevents `any` + “conversion may be a mistake” warnings)
+      const res = await query.range(from, to);
+
+      const error: PostgrestError | null =
+        (res as { error: PostgrestError | null }).error ?? null;
+
+      const count: number | null =
+        (res as { count: number | null }).count ?? null;
+
+      const dataUnknown: unknown = (res as { data: unknown }).data ?? null;
 
       if (error) throw error;
 
-      const rawRows = data ?? [];
+      const rawRows: TicketRowRaw[] = Array.isArray(dataUnknown)
+        ? (dataUnknown as unknown as TicketRowRaw[])
+        : [];
 
       // Normalize nested relations so UI always receives single objects or null
       const normalized: TicketRow[] = rawRows.map((r) => ({
@@ -212,20 +233,29 @@ export default function AdminTicketsPage() {
   }, [fetchTickets]);
 
   // Realtime refresh: if any ticket changes, re-fetch current page.
+  // Throttle bursts to a single fetch (prevents “spam fetch” during draws/imports)
+  const rtTimerRef = useRef<number | null>(null);
+
   useEffect(() => {
-    const channel = supabase
+    let channel: RealtimeChannel | null = null;
+
+    channel = supabase
       .channel("admin_tickets_live")
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "tickets" },
         () => {
-          fetchTickets();
+          if (rtTimerRef.current) window.clearTimeout(rtTimerRef.current);
+          rtTimerRef.current = window.setTimeout(() => {
+            fetchTickets();
+          }, 200);
         }
       )
       .subscribe();
 
     return () => {
-      supabase.removeChannel(channel);
+      if (rtTimerRef.current) window.clearTimeout(rtTimerRef.current);
+      if (channel) supabase.removeChannel(channel);
     };
   }, [fetchTickets]);
 

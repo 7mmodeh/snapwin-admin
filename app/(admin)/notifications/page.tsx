@@ -2,6 +2,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import type { PostgrestError } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
 
@@ -20,6 +21,86 @@ type NotificationRow = {
 
 type AudienceFilter = "all" | "customer" | "admin";
 type ReadFilter = "all" | "unread" | "read";
+
+/**
+ * Raw shape from Supabase (unknown-safe).
+ * We normalize with runtime guards to avoid casts.
+ */
+type NotificationRowRaw = {
+  id?: unknown;
+  customer_id?: unknown;
+  raffle_id?: unknown;
+  type?: unknown;
+  audience?: unknown;
+  title?: unknown;
+  body?: unknown;
+  is_read?: unknown;
+  created_at?: unknown;
+  read_at?: unknown;
+};
+
+const NOTIFICATIONS_SELECT =
+  "id, customer_id, raffle_id, type, audience, title, body, is_read, created_at, read_at";
+
+function toStringOrNull(v: unknown): string | null {
+  if (v == null) return null;
+  return typeof v === "string" ? v : String(v);
+}
+
+function toStringOrEmpty(v: unknown): string {
+  if (v == null) return "";
+  return typeof v === "string" ? v : String(v);
+}
+
+function toBoolean(v: unknown): boolean {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v !== 0;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (s === "true" || s === "t" || s === "1" || s === "yes") return true;
+    if (s === "false" || s === "f" || s === "0" || s === "no") return false;
+  }
+  return false;
+}
+
+/**
+ * Tiny runtime normalization:
+ * - Ensures required fields exist
+ * - Coerces audience/type/title/body to strings
+ * - Coerces is_read to boolean
+ * - Normalizes created_at/read_at/customer_id/raffle_id
+ */
+function normalizeNotificationRow(
+  raw: NotificationRowRaw
+): NotificationRow | null {
+  const id = typeof raw.id === "string" ? raw.id : null;
+  const created_at = typeof raw.created_at === "string" ? raw.created_at : null;
+
+  const title = toStringOrEmpty(raw.title).trim();
+  const body = toStringOrEmpty(raw.body).trim();
+
+  if (!id || !created_at || !title) return null;
+
+  const customer_id = toStringOrNull(raw.customer_id);
+  const raffle_id = toStringOrNull(raw.raffle_id);
+  const read_at = toStringOrNull(raw.read_at);
+
+  const audience = toStringOrEmpty(raw.audience).trim() || "customer";
+  const type = toStringOrEmpty(raw.type).trim() || "system";
+
+  return {
+    id,
+    customer_id,
+    raffle_id,
+    type,
+    audience,
+    title,
+    body,
+    is_read: toBoolean(raw.is_read),
+    created_at,
+    read_at,
+  };
+}
 
 export default function NotificationsPage() {
   const [notifications, setNotifications] = useState<NotificationRow[]>([]);
@@ -47,24 +128,35 @@ export default function NotificationsPage() {
         setLoading(true);
         setError(null);
 
-        const { data, error } = await supabase
+        const res = await supabase
           .from("notifications")
-          .select(
-            "id, customer_id, raffle_id, type, audience, title, body, is_read, created_at, read_at"
-          )
+          .select(NOTIFICATIONS_SELECT)
           .order("created_at", { ascending: false })
           .limit(200);
 
-        if (error) throw error;
+        const qErr: PostgrestError | null =
+          (res as { error: PostgrestError | null }).error ?? null;
+        const dataUnknown: unknown = (res as { data: unknown }).data ?? null;
 
-        setNotifications((data ?? []) as NotificationRow[]);
+        if (qErr) throw qErr;
+
+        const rawList: NotificationRowRaw[] = Array.isArray(dataUnknown)
+          ? (dataUnknown as NotificationRowRaw[])
+          : [];
+
+        const normalized: NotificationRow[] = [];
+        for (const r of rawList) {
+          const n = normalizeNotificationRow(r);
+          if (n) normalized.push(n);
+        }
+
+        setNotifications(normalized);
       } catch (err: unknown) {
         console.error("Error loading notifications:", err);
-        if (err instanceof Error) {
-          setError(err.message);
-        } else {
-          setError("Failed to load notifications.");
-        }
+        setError(
+          err instanceof Error ? err.message : "Failed to load notifications."
+        );
+        setNotifications([]);
       } finally {
         setLoading(false);
       }
@@ -77,9 +169,8 @@ export default function NotificationsPage() {
     let result = [...notifications];
 
     if (audienceFilter !== "all") {
-      result = result.filter(
-        (n) => n.audience.toLowerCase() === audienceFilter
-      );
+      const af = audienceFilter.toLowerCase();
+      result = result.filter((n) => (n.audience || "").toLowerCase() === af);
     }
 
     if (readFilter === "unread") {
@@ -90,20 +181,25 @@ export default function NotificationsPage() {
 
     const q = search.trim().toLowerCase();
     if (q) {
-      result = result.filter(
-        (n) =>
+      result = result.filter((n) => {
+        return (
           n.title.toLowerCase().includes(q) ||
           n.body.toLowerCase().includes(q) ||
           (n.customer_id ?? "").toLowerCase().includes(q) ||
-          (n.raffle_id ?? "").toLowerCase().includes(q)
-      );
+          (n.raffle_id ?? "").toLowerCase().includes(q) ||
+          (n.type ?? "").toLowerCase().includes(q) ||
+          (n.audience ?? "").toLowerCase().includes(q)
+        );
+      });
     }
 
     return result;
   }, [notifications, audienceFilter, readFilter, search]);
 
   const handleCreate = async () => {
-    if (!newTitle.trim() || !newBody.trim()) return;
+    const title = newTitle.trim();
+    const body = newBody.trim();
+    if (!title || !body) return;
 
     try {
       setCreating(true);
@@ -111,27 +207,35 @@ export default function NotificationsPage() {
       setCreateSuccess(null);
 
       const payload = {
-        title: newTitle.trim(),
-        body: newBody.trim(),
-        audience: newAudience as string, // matches your enum value
-        type: "system" as string, // safe default
+        title,
+        body,
+        audience: newAudience, // matches enum values
+        type: "system",
         customer_id: targetCustomerId.trim() || null,
         raffle_id: null,
-        data: {},
+        data: {}, // if your table doesn't have `data`, remove this line
         is_read: false,
       };
 
-      const { data, error } = await supabase
+      const res = await supabase
         .from("notifications")
         .insert(payload)
-        .select(
-          "id, customer_id, raffle_id, type, audience, title, body, is_read, created_at, read_at"
-        )
-        .single<NotificationRow>();
+        .select(NOTIFICATIONS_SELECT)
+        .single();
 
-      if (error) throw error;
+      const qErr: PostgrestError | null =
+        (res as { error: PostgrestError | null }).error ?? null;
+      const dataUnknown: unknown = (res as { data: unknown }).data ?? null;
 
-      setNotifications((prev) => [data, ...prev]);
+      if (qErr) throw qErr;
+
+      const created = normalizeNotificationRow(
+        dataUnknown as NotificationRowRaw
+      );
+      if (!created)
+        throw new Error("Notification created but could not be normalized.");
+
+      setNotifications((prev) => [created, ...prev]);
       setNewTitle("");
       setNewBody("");
       setTargetCustomerId("");
@@ -139,11 +243,9 @@ export default function NotificationsPage() {
       setCreateSuccess("Notification created successfully.");
     } catch (err: unknown) {
       console.error("Error creating notification:", err);
-      if (err instanceof Error) {
-        setCreateError(err.message);
-      } else {
-        setCreateError("Failed to create notification.");
-      }
+      setCreateError(
+        err instanceof Error ? err.message : "Failed to create notification."
+      );
     } finally {
       setCreating(false);
     }
@@ -446,12 +548,13 @@ export default function NotificationsPage() {
                             ID: {n.id}
                           </div>
                         </td>
+
                         <td className="px-3 py-2 align-top">
                           <span
                             className="px-2 py-1 rounded-full text-[0.65rem] font-semibold"
                             style={{
                               backgroundColor:
-                                n.audience === "admin"
+                                n.audience.toLowerCase() === "admin"
                                   ? COLORS.info
                                   : COLORS.tabActiveBg,
                               color: COLORS.textOnPrimary,
@@ -460,6 +563,7 @@ export default function NotificationsPage() {
                             {n.audience}
                           </span>
                         </td>
+
                         <td className="px-3 py-2 align-top">
                           {n.is_read ? (
                             <span
@@ -477,6 +581,7 @@ export default function NotificationsPage() {
                             </span>
                           )}
                         </td>
+
                         <td className="px-3 py-2 align-top">
                           <div
                             className="text-[0.7rem]"
@@ -485,6 +590,7 @@ export default function NotificationsPage() {
                             {n.customer_id ?? "—"}
                           </div>
                         </td>
+
                         <td className="px-3 py-2 align-top">
                           <div
                             className="text-[0.7rem]"
@@ -493,6 +599,7 @@ export default function NotificationsPage() {
                             {n.raffle_id ?? "—"}
                           </div>
                         </td>
+
                         <td className="px-3 py-2 align-top">
                           <span
                             className="text-[0.7rem]"

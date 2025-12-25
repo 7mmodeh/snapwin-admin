@@ -1,10 +1,16 @@
+// app/(admin)/tickets/[id]/page.tsx
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
+import type { PostgrestError, RealtimeChannel } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
+
+type PaymentStatus = "pending" | "completed" | "failed";
+
+type OneOrMany<T> = T | T[] | null;
 
 type TicketDetail = {
   id: string;
@@ -13,7 +19,7 @@ type TicketDetail = {
   ticket_number: number;
   ticket_code: string | null;
 
-  payment_status: string;
+  payment_status: PaymentStatus | string;
   payment_intent_id: string | null;
   checkout_session_id: string | null;
 
@@ -36,6 +42,42 @@ type TicketDetail = {
   } | null;
   customers?: { id: string; email: string } | null;
 };
+
+type TicketDetailRaw = Omit<TicketDetail, "raffles" | "customers"> & {
+  raffles?: OneOrMany<{
+    id: string;
+    item_name: string;
+    ticket_price: number;
+    status: string;
+  }>;
+  customers?: OneOrMany<{ id: string; email: string }>;
+};
+
+function firstOrNull<T>(v: OneOrMany<T> | undefined): T | null {
+  if (!v) return null;
+  return Array.isArray(v) ? v[0] ?? null : v;
+}
+
+function toStringOrNull(v: unknown): string | null {
+  if (v == null) return null;
+  return typeof v === "string" ? v : String(v);
+}
+
+function toNumberOrNull(v: unknown): number | null {
+  if (v == null) return null;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  const n = parseFloat(String(v));
+  return Number.isNaN(n) ? null : n;
+}
+
+function toErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === "object") {
+    const pe = err as Partial<PostgrestError>;
+    if (typeof pe.message === "string" && pe.message.trim()) return pe.message;
+  }
+  return "Failed to load ticket.";
+}
 
 function formatMoney(amount: number | null, currency: string | null) {
   if (amount == null) return "—";
@@ -77,49 +119,20 @@ export default function AdminTicketDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [ticket, setTicket] = useState<TicketDetail | null>(null);
 
-  const statusBadge = useMemo(() => {
-    const s = ticket?.payment_status;
-    const label =
-      s === "completed"
-        ? "Completed"
-        : s === "pending"
-        ? "Pending"
-        : s === "failed"
-        ? "Failed"
-        : s || "—";
-    const bg =
-      s === "completed"
-        ? "#ECFDF5"
-        : s === "pending"
-        ? "#FFFBEB"
-        : s === "failed"
-        ? "#FEF2F2"
-        : COLORS.highlightCardBg;
-    const border =
-      s === "completed"
-        ? "#6EE7B7"
-        : s === "pending"
-        ? "#FCD34D"
-        : s === "failed"
-        ? "#FCA5A5"
-        : COLORS.cardBorder;
-    const color = s === "failed" ? COLORS.error : COLORS.textPrimary;
+  // Throttle realtime bursts
+  const rtTimerRef = useRef<number | null>(null);
 
-    return { label, bg, border, color };
-  }, [ticket?.payment_status]);
+  const fetchTicket = useCallback(async () => {
+    if (!ticketId) return;
 
-  useEffect(() => {
-    const fetchTicket = async () => {
-      if (!ticketId) return;
+    try {
+      setLoading(true);
+      setError(null);
 
-      try {
-        setLoading(true);
-        setError(null);
-
-        const { data, error } = await supabase
-          .from("tickets")
-          .select(
-            `
+      const { data, error: qErr } = await supabase
+        .from("tickets")
+        .select(
+          `
             id,
             raffle_id,
             customer_id,
@@ -138,29 +151,112 @@ export default function AdminTicketDetailPage() {
             raffles ( id, item_name, ticket_price, status ),
             customers ( id, email )
           `
-          )
-          .eq("id", ticketId)
-          .maybeSingle<TicketDetail>();
+        )
+        .eq("id", ticketId)
+        .maybeSingle()
+        .returns<TicketDetailRaw>();
 
-        if (error) throw error;
-        if (!data) {
-          setError("Ticket not found.");
-          setTicket(null);
-          return;
-        }
-
-        setTicket(data);
-      } catch (err: unknown) {
-        console.error("Admin ticket detail fetch error:", err);
-        setError(err instanceof Error ? err.message : "Failed to load ticket.");
+      if (qErr) throw qErr;
+      if (!data) {
+        setError("Ticket not found.");
         setTicket(null);
-      } finally {
-        setLoading(false);
+        return;
       }
+
+      // Normalize amount (safety) + nested relations (object vs array)
+      const normalized: TicketDetail = {
+        ...data,
+        payment_amount: toNumberOrNull(data.payment_amount),
+        payment_currency: toStringOrNull(data.payment_currency),
+        payment_method: toStringOrNull(data.payment_method),
+        payment_intent_id: toStringOrNull(data.payment_intent_id),
+        checkout_session_id: toStringOrNull(data.checkout_session_id),
+        payment_completed_at: toStringOrNull(data.payment_completed_at),
+        payment_error: toStringOrNull(data.payment_error),
+        created_at: toStringOrNull(data.created_at),
+        ticket_code: toStringOrNull(data.ticket_code),
+        raffles: firstOrNull(data.raffles),
+        customers: firstOrNull(data.customers),
+      };
+
+      setTicket(normalized);
+    } catch (err: unknown) {
+      console.error("Admin ticket detail fetch error:", err);
+      setError(toErrorMessage(err));
+      setTicket(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [ticketId]);
+
+  useEffect(() => {
+    fetchTicket();
+  }, [fetchTicket]);
+
+  // Optional realtime refresh: if the ticket changes, re-fetch
+  useEffect(() => {
+    if (!ticketId) return;
+
+    const scheduleRefresh = () => {
+      if (rtTimerRef.current) window.clearTimeout(rtTimerRef.current);
+      rtTimerRef.current = window.setTimeout(() => {
+        fetchTicket();
+      }, 250);
     };
 
-    fetchTicket();
-  }, [ticketId]);
+    const channel: RealtimeChannel = supabase
+      .channel(`admin_ticket_${ticketId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "tickets",
+          filter: `id=eq.${ticketId}`,
+        },
+        () => scheduleRefresh()
+      )
+      .subscribe();
+
+    return () => {
+      if (rtTimerRef.current) window.clearTimeout(rtTimerRef.current);
+      supabase.removeChannel(channel);
+    };
+  }, [ticketId, fetchTicket]);
+
+  const statusBadge = useMemo(() => {
+    const s = ticket?.payment_status;
+    const label =
+      s === "completed"
+        ? "Completed"
+        : s === "pending"
+        ? "Pending"
+        : s === "failed"
+        ? "Failed"
+        : (s as string) || "—";
+
+    const bg =
+      s === "completed"
+        ? "#ECFDF5"
+        : s === "pending"
+        ? "#FFFBEB"
+        : s === "failed"
+        ? "#FEF2F2"
+        : COLORS.highlightCardBg;
+
+    const border =
+      s === "completed"
+        ? "#6EE7B7"
+        : s === "pending"
+        ? "#FCD34D"
+        : s === "failed"
+        ? "#FCA5A5"
+        : COLORS.cardBorder;
+
+    const color = s === "failed" ? COLORS.error : COLORS.textPrimary;
+
+    return { label, bg, border, color };
+  }, [ticket?.payment_status]);
 
   if (loading) {
     return (
