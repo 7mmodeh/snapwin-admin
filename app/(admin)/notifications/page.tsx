@@ -1,32 +1,47 @@
-// app/(admin)/notifications/page.tsx
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { PostgrestError } from "@supabase/supabase-js";
-import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
+
+/* -------------------------------- Types --------------------------------- */
 
 type NotificationRow = {
   id: string;
   customer_id: string | null;
   raffle_id: string | null;
-  type: string;
-  audience: string;
+  type: string; // notification_type enum in DB, but keep string-safe
+  audience: string; // notification_audience enum in DB, keep string-safe
   title: string;
   body: string;
   is_read: boolean;
   created_at: string;
   read_at: string | null;
+  data: Record<string, unknown> | null;
 };
 
 type AudienceFilter = "all" | "customer" | "admin";
 type ReadFilter = "all" | "unread" | "read";
-type TypeFilter = "all" | "payment" | "support" | "raffle" | "system" | "other";
+type KindFilter =
+  | "all"
+  | "ticket"
+  | "support"
+  | "customer"
+  | "system"
+  | "other";
+
+type AdminAction = {
+  label: string;
+  href: string;
+  variant?: "primary" | "secondary";
+  title?: string;
+};
 
 /**
  * Raw shape from Supabase (unknown-safe).
- * We normalize with runtime guards to avoid casts.
+ * We normalize with runtime guards to avoid unsafe casts.
  */
 type NotificationRowRaw = {
   id?: unknown;
@@ -39,10 +54,17 @@ type NotificationRowRaw = {
   is_read?: unknown;
   created_at?: unknown;
   read_at?: unknown;
+  data?: unknown;
 };
 
 const NOTIFICATIONS_SELECT =
-  "id, customer_id, raffle_id, type, audience, title, body, is_read, created_at, read_at";
+  "id, customer_id, raffle_id, type, audience, title, body, is_read, created_at, read_at, data";
+
+/* ------------------------------ Safe helpers ----------------------------- */
+
+function safeLower(x: string | null | undefined) {
+  return (x ?? "").toLowerCase().trim();
+}
 
 function toStringOrNull(v: unknown): string | null {
   if (v == null) return null;
@@ -65,16 +87,59 @@ function toBoolean(v: unknown): boolean {
   return false;
 }
 
-function safeLower(x: string | null | undefined) {
-  return (x ?? "").toLowerCase().trim();
+function toRecordOrNull(v: unknown): Record<string, unknown> | null {
+  if (!v || typeof v !== "object") return null;
+  if (Array.isArray(v)) return null;
+  return v as Record<string, unknown>;
 }
 
 function isoNow() {
   return new Date().toISOString();
 }
 
-function relativeTime(iso: string) {
-  const ts = new Date(iso).getTime();
+function truncate(s: string, n: number) {
+  if (s.length <= n) return s;
+  return s.slice(0, n - 1) + "…";
+}
+
+function extractUuidFromText(s: string): string | null {
+  const m = s.match(
+    /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
+  );
+  return m ? m[0] : null;
+}
+
+function tryGetString(
+  data: Record<string, unknown> | null,
+  key: string
+): string | null {
+  if (!data) return null;
+  const v = data[key];
+  return typeof v === "string" ? v : v != null ? String(v) : null;
+}
+
+/**
+ * Supabase Postgres timestamps often look like:
+ * "2025-12-25 16:21:29.612469+00"
+ * which is NOT reliably parsed by all browsers as Date.
+ * Normalize it into ISO by replacing space with 'T' when needed.
+ */
+function parseDateSafe(isoish: string): Date {
+  // If it already contains 'T', Date() is usually fine.
+  if (isoish.includes("T")) return new Date(isoish);
+
+  // Convert "YYYY-MM-DD HH:MM:SS....+00" => "YYYY-MM-DDTHH:MM:SS....+00"
+  const normalized = isoish.replace(" ", "T");
+  const d = new Date(normalized);
+
+  // If still invalid, fall back to raw Date (worst-case)
+  if (Number.isNaN(d.getTime())) return new Date(isoish);
+
+  return d;
+}
+
+function relativeTime(isoish: string) {
+  const ts = parseDateSafe(isoish).getTime();
   const now = Date.now();
   const diff = Math.max(0, now - ts);
 
@@ -84,7 +149,7 @@ function relativeTime(iso: string) {
   const day = Math.floor(hr / 24);
 
   if (day >= 7) {
-    return new Date(iso).toLocaleDateString("en-IE", {
+    return parseDateSafe(isoish).toLocaleDateString("en-IE", {
       day: "2-digit",
       month: "short",
       year: "numeric",
@@ -100,8 +165,8 @@ function relativeTime(iso: string) {
   return "Just now";
 }
 
-function dayBucket(iso: string): "Today" | "Yesterday" | "Earlier" {
-  const d = new Date(iso);
+function dayBucket(isoish: string): "Today" | "Yesterday" | "Earlier" {
+  const d = parseDateSafe(isoish);
   const now = new Date();
 
   const startOfToday = new Date(
@@ -117,11 +182,6 @@ function dayBucket(iso: string): "Today" | "Yesterday" | "Earlier" {
   return "Earlier";
 }
 
-function truncate(s: string, n: number) {
-  if (s.length <= n) return s;
-  return s.slice(0, n - 1) + "…";
-}
-
 function copyToClipboard(text: string) {
   try {
     navigator.clipboard?.writeText(text);
@@ -130,13 +190,8 @@ function copyToClipboard(text: string) {
   }
 }
 
-/**
- * Tiny runtime normalization:
- * - Ensures required fields exist
- * - Coerces audience/type/title/body to strings
- * - Coerces is_read to boolean
- * - Normalizes created_at/read_at/customer_id/raffle_id
- */
+/* ----------------------------- Normalization ----------------------------- */
+
 function normalizeNotificationRow(
   raw: NotificationRowRaw
 ): NotificationRow | null {
@@ -166,6 +221,7 @@ function normalizeNotificationRow(
     is_read: toBoolean(raw.is_read),
     created_at,
     read_at,
+    data: toRecordOrNull(raw.data),
   };
 }
 
@@ -177,23 +233,198 @@ function mergeById<T extends { id: string }>(prev: T[], next: T): T[] {
   return clone;
 }
 
-function typeBucket(type: string): TypeFilter {
-  const t = safeLower(type);
-  if (!t) return "other";
+/* ------------------------- Kind inference + actions ---------------------- */
+
+/**
+ * We prefer `data.event` because your triggers already set it:
+ * - admin_ticket_purchased
+ * - admin_new_customer
+ * - customer_created
+ * etc.
+ *
+ * For older/system notifications that don’t have consistent data, we fallback
+ * to title/body parsing.
+ */
+function inferKind(n: NotificationRow): KindFilter {
+  const type = safeLower(n.type);
+  if (type === "ticket_purchased") return "ticket";
+
+  const event = safeLower(tryGetString(n.data, "event"));
+  if (event.includes("ticket")) return "ticket";
+  if (event.includes("support")) return "support";
+  if (event.includes("customer")) return "customer";
+
+  const t = safeLower(n.title);
+  const b = safeLower(n.body);
+
+  if (t.includes("support") || b.includes("support") || b.includes("request"))
+    return "support";
   if (
-    t.includes("payment") ||
-    t.includes("stripe") ||
-    t.includes("checkout") ||
-    t.includes("ticket")
+    t.includes("registered") ||
+    b.includes("created an account") ||
+    b.includes("joined snapwin")
   )
-    return "payment";
-  if (t.includes("support")) return "support";
-  if (t.includes("raffle") || t.includes("draw") || t.includes("winner"))
-    return "raffle";
-  if (t.includes("system") || t.includes("admin") || t.includes("security"))
-    return "system";
+    return "customer";
+  if (t.includes("ticket") || b.includes("ticket #") || b.includes("purchased"))
+    return "ticket";
+
+  if (type === "system") return "system";
   return "other";
 }
+
+function buildAdminActions(n: NotificationRow): AdminAction[] {
+  const actions: AdminAction[] = [];
+
+  const type = safeLower(n.type);
+  const kind = inferKind(n);
+
+  // Use data where available
+  const event = safeLower(tryGetString(n.data, "event"));
+  const dataTicketId = tryGetString(n.data, "ticket_id");
+  const dataCustomerId = tryGetString(n.data, "customer_id");
+  const dataRaffleId = tryGetString(n.data, "raffle_id");
+  const supportIdFromData = tryGetString(n.data, "support_request_id"); // if you add later
+
+  const raffleId = n.raffle_id ?? dataRaffleId ?? null;
+  const customerId = n.customer_id ?? dataCustomerId ?? null;
+
+  // 1) Ticket purchased
+  if (
+    type === "ticket_purchased" ||
+    kind === "ticket" ||
+    event.includes("ticket")
+  ) {
+    if (raffleId) {
+      actions.push({
+        label: "Open raffle",
+        href: `/raffles/${raffleId}`,
+        variant: "primary",
+      });
+      actions.push({
+        label: "View tickets",
+        href: `/tickets?raffle_id=${raffleId}`,
+        variant: "secondary",
+      });
+    } else {
+      actions.push({
+        label: "View tickets",
+        href: `/tickets`,
+        variant: "primary",
+      });
+    }
+
+    if (dataTicketId) {
+      // If your tickets list supports ticket_id filter, this becomes even better.
+      // Still useful: link to tickets list with search param.
+      actions.push({
+        label: "Find ticket",
+        href: `/tickets?ticket_id=${dataTicketId}`,
+        variant: "secondary",
+      });
+    }
+
+    if (customerId)
+      actions.push({
+        label: "Open customer",
+        href: `/customers/${customerId}`,
+        variant: "secondary",
+      });
+
+    return actions.slice(0, 3);
+  }
+
+  // 2) Support-related
+  if (kind === "support" || event.includes("support")) {
+    const supportId =
+      supportIdFromData ||
+      extractUuidFromText(n.body) || // your body has Request <uuid> changed: ...
+      null;
+
+    if (supportId) {
+      actions.push({
+        label: "Open support request",
+        href: `/support/${supportId}`,
+        variant: "primary",
+      });
+    } else if (raffleId) {
+      actions.push({
+        label: "View support (raffle)",
+        href: `/support?raffle_id=${raffleId}`,
+        variant: "primary",
+      });
+    } else if (customerId) {
+      actions.push({
+        label: "View support (customer)",
+        href: `/support?customer_id=${customerId}`,
+        variant: "primary",
+      });
+    } else {
+      actions.push({
+        label: "View support",
+        href: `/support`,
+        variant: "primary",
+      });
+    }
+
+    if (raffleId)
+      actions.push({
+        label: "Open raffle",
+        href: `/raffles/${raffleId}`,
+        variant: "secondary",
+      });
+    if (customerId)
+      actions.push({
+        label: "Open customer",
+        href: `/customers/${customerId}`,
+        variant: "secondary",
+      });
+
+    return actions.slice(0, 3);
+  }
+
+  // 3) Customer-related
+  if (kind === "customer" || event.includes("customer")) {
+    if (customerId) {
+      actions.push({
+        label: "Open customer",
+        href: `/customers/${customerId}`,
+        variant: "primary",
+      });
+    } else {
+      actions.push({
+        label: "View customers",
+        href: `/customers`,
+        variant: "primary",
+      });
+    }
+    return actions;
+  }
+
+  // 4) General system fallback
+  if (raffleId)
+    actions.push({
+      label: "Open raffle",
+      href: `/raffles/${raffleId}`,
+      variant: "primary",
+    });
+  if (customerId)
+    actions.push({
+      label: "Open customer",
+      href: `/customers/${customerId}`,
+      variant: actions.length ? "secondary" : "primary",
+    });
+
+  if (actions.length === 0)
+    actions.push({
+      label: "Open dashboard",
+      href: `/dashboard`,
+      variant: "primary",
+    });
+
+  return actions.slice(0, 2);
+}
+
+/* --------------------------------- Page --------------------------------- */
 
 export default function NotificationsPage() {
   const [notifications, setNotifications] = useState<NotificationRow[]>([]);
@@ -202,10 +433,10 @@ export default function NotificationsPage() {
 
   const [audienceFilter, setAudienceFilter] = useState<AudienceFilter>("all");
   const [readFilter, setReadFilter] = useState<ReadFilter>("unread");
-  const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
+  const [kindFilter, setKindFilter] = useState<KindFilter>("all");
   const [search, setSearch] = useState("");
 
-  // Bulk selection
+  // Bulk selection / busy states
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [busyIds, setBusyIds] = useState<Record<string, boolean>>({});
   const [bulkBusy, setBulkBusy] = useState(false);
@@ -238,7 +469,7 @@ export default function NotificationsPage() {
           .from("notifications")
           .select(NOTIFICATIONS_SELECT)
           .order("created_at", { ascending: false })
-          .limit(300);
+          .limit(400);
 
         const qErr: PostgrestError | null =
           (res as { error: PostgrestError | null }).error ?? null;
@@ -257,10 +488,18 @@ export default function NotificationsPage() {
         }
 
         if (!mountedRef.current) return;
-        setNotifications(normalized);
+
+        setNotifications(
+          normalized.sort(
+            (a, b) =>
+              parseDateSafe(b.created_at).getTime() -
+              parseDateSafe(a.created_at).getTime()
+          )
+        );
       } catch (err: unknown) {
         console.error("Error loading notifications:", err);
         if (!mountedRef.current) return;
+
         setError(
           err instanceof Error ? err.message : "Failed to load notifications."
         );
@@ -277,7 +516,7 @@ export default function NotificationsPage() {
     };
   }, []);
 
-  // Realtime: new notifications + read-state changes should show immediately
+  // Realtime updates
   useEffect(() => {
     const channel = supabase
       .channel("admin-notifications-live")
@@ -295,8 +534,8 @@ export default function NotificationsPage() {
             const merged = mergeById(prev, n);
             return merged.sort(
               (a, b) =>
-                new Date(b.created_at).getTime() -
-                new Date(a.created_at).getTime()
+                parseDateSafe(b.created_at).getTime() -
+                parseDateSafe(a.created_at).getTime()
             );
           });
         }
@@ -324,8 +563,8 @@ export default function NotificationsPage() {
     if (readFilter === "unread") result = result.filter((n) => !n.is_read);
     if (readFilter === "read") result = result.filter((n) => n.is_read);
 
-    if (typeFilter !== "all") {
-      result = result.filter((n) => typeBucket(n.type) === typeFilter);
+    if (kindFilter !== "all") {
+      result = result.filter((n) => inferKind(n) === kindFilter);
     }
 
     const q = search.trim().toLowerCase();
@@ -337,13 +576,16 @@ export default function NotificationsPage() {
           (n.customer_id ?? "").toLowerCase().includes(q) ||
           (n.raffle_id ?? "").toLowerCase().includes(q) ||
           (n.type ?? "").toLowerCase().includes(q) ||
-          (n.audience ?? "").toLowerCase().includes(q)
+          (n.audience ?? "").toLowerCase().includes(q) ||
+          JSON.stringify(n.data ?? {})
+            .toLowerCase()
+            .includes(q)
         );
       });
     }
 
     return result;
-  }, [notifications, audienceFilter, readFilter, typeFilter, search]);
+  }, [notifications, audienceFilter, readFilter, kindFilter, search]);
 
   const grouped = useMemo(() => {
     const g: Record<"Today" | "Yesterday" | "Earlier", NotificationRow[]> = {
@@ -351,10 +593,7 @@ export default function NotificationsPage() {
       Yesterday: [],
       Earlier: [],
     };
-
-    for (const n of filtered) {
-      g[dayBucket(n.created_at)].push(n);
-    }
+    for (const n of filtered) g[dayBucket(n.created_at)].push(n);
     return g;
   }, [filtered]);
 
@@ -365,11 +604,10 @@ export default function NotificationsPage() {
         .map(([k]) => k),
     [selected]
   );
-
   const anySelected = useMemo(() => selectedIds.length > 0, [selectedIds]);
 
-  const toggleOne = (id: string) =>
-    setSelected((p) => ({ ...p, [id]: !p[id] }));
+  // const toggleOne = (id: string) =>
+  //   setSelected((p) => ({ ...p, [id]: !p[id] }));
 
   const toggleSelectVisible = () => {
     const visible = filtered.map((n) => n.id);
@@ -386,7 +624,6 @@ export default function NotificationsPage() {
   const updateReadState = async (id: string, read: boolean) => {
     try {
       setBusy(id, true);
-
       const readAt = read ? isoNow() : null;
 
       // Optimistic
@@ -506,6 +743,7 @@ export default function NotificationsPage() {
         raffle_id: null,
         is_read: false,
         read_at: null,
+        data: { event: "admin_manual_system" }, // safe & useful for routing/search
       };
 
       const res = await supabase
@@ -582,7 +820,7 @@ export default function NotificationsPage() {
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search title/body/type/IDs..."
+              placeholder="Search title/body/type/IDs/event..."
               className="w-full border rounded px-3 py-2 text-sm"
               style={{
                 borderColor: COLORS.inputBorder,
@@ -618,7 +856,7 @@ export default function NotificationsPage() {
           </div>
 
           <div className="text-xs" style={{ color: COLORS.textMuted }}>
-            Preview shows how it will appear in the inbox.
+            Preview shows how it appears in the inbox.
           </div>
         </div>
 
@@ -802,6 +1040,7 @@ export default function NotificationsPage() {
                       label={newAudience === "admin" ? "Admin" : "Customer"}
                       kind={newAudience}
                     />
+                    <TypePill kind="system" />
                     <span
                       className="text-sm font-semibold truncate"
                       style={{ color: COLORS.textPrimary }}
@@ -832,9 +1071,9 @@ export default function NotificationsPage() {
                     className="text-[0.7rem] mt-2"
                     style={{ color: COLORS.textMuted }}
                   >
-                    Just now • Type: system
+                    Just now • event: admin_manual_system
                     {targetCustomerId.trim()
-                      ? ` • Customer: ${targetCustomerId.trim().slice(0, 8)}…`
+                      ? ` • customer: ${targetCustomerId.trim().slice(0, 8)}…`
                       : ""}
                   </div>
                 </div>
@@ -852,7 +1091,7 @@ export default function NotificationsPage() {
               className="text-[0.7rem] mt-3"
               style={{ color: COLORS.textMuted }}
             >
-              Tip: keep titles short and put details in the message body.
+              Tip: Keep titles short and put details in the message body.
             </div>
           </div>
         </div>
@@ -931,33 +1170,33 @@ export default function NotificationsPage() {
               <div className="flex flex-wrap gap-2">
                 <FilterChip
                   label="All types"
-                  active={typeFilter === "all"}
-                  onClick={() => setTypeFilter("all")}
+                  active={kindFilter === "all"}
+                  onClick={() => setKindFilter("all")}
                 />
                 <FilterChip
-                  label="Payments"
-                  active={typeFilter === "payment"}
-                  onClick={() => setTypeFilter("payment")}
+                  label="Tickets"
+                  active={kindFilter === "ticket"}
+                  onClick={() => setKindFilter("ticket")}
                 />
                 <FilterChip
                   label="Support"
-                  active={typeFilter === "support"}
-                  onClick={() => setTypeFilter("support")}
+                  active={kindFilter === "support"}
+                  onClick={() => setKindFilter("support")}
                 />
                 <FilterChip
-                  label="Raffles"
-                  active={typeFilter === "raffle"}
-                  onClick={() => setTypeFilter("raffle")}
+                  label="Customers"
+                  active={kindFilter === "customer"}
+                  onClick={() => setKindFilter("customer")}
                 />
                 <FilterChip
                   label="System"
-                  active={typeFilter === "system"}
-                  onClick={() => setTypeFilter("system")}
+                  active={kindFilter === "system"}
+                  onClick={() => setKindFilter("system")}
                 />
                 <FilterChip
                   label="Other"
-                  active={typeFilter === "other"}
-                  onClick={() => setTypeFilter("other")}
+                  active={kindFilter === "other"}
+                  onClick={() => setKindFilter("other")}
                 />
               </div>
 
@@ -1019,7 +1258,7 @@ export default function NotificationsPage() {
                 items={grouped.Today}
                 selected={selected}
                 busyIds={busyIds}
-                onToggle={toggleOne}
+                onToggle={(id) => setSelected((p) => ({ ...p, [id]: !p[id] }))}
                 onMarkRead={updateReadState}
               />
               <NotificationGroup
@@ -1027,7 +1266,7 @@ export default function NotificationsPage() {
                 items={grouped.Yesterday}
                 selected={selected}
                 busyIds={busyIds}
-                onToggle={toggleOne}
+                onToggle={(id) => setSelected((p) => ({ ...p, [id]: !p[id] }))}
                 onMarkRead={updateReadState}
               />
               <NotificationGroup
@@ -1035,7 +1274,7 @@ export default function NotificationsPage() {
                 items={grouped.Earlier}
                 selected={selected}
                 busyIds={busyIds}
-                onToggle={toggleOne}
+                onToggle={(id) => setSelected((p) => ({ ...p, [id]: !p[id] }))}
                 onMarkRead={updateReadState}
               />
             </div>
@@ -1045,6 +1284,8 @@ export default function NotificationsPage() {
     </div>
   );
 }
+
+/* ------------------------------ UI Components ---------------------------- */
 
 function FilterChip({
   label,
@@ -1085,21 +1326,20 @@ function Pill({ label, kind }: { label: string; kind: "customer" | "admin" }) {
   );
 }
 
-function TypePill({ type }: { type: string }) {
-  const b = typeBucket(type);
+function TypePill({ kind }: { kind: KindFilter }) {
   let bg = COLORS.tabActiveBg;
   let label = "Other";
 
-  if (b === "payment") {
+  if (kind === "ticket") {
     bg = COLORS.success;
-    label = "Payments";
-  } else if (b === "support") {
+    label = "Tickets";
+  } else if (kind === "support") {
     bg = COLORS.info;
     label = "Support";
-  } else if (b === "raffle") {
+  } else if (kind === "customer") {
     bg = COLORS.accent;
-    label = "Raffles";
-  } else if (b === "system") {
+    label = "Customers";
+  } else if (kind === "system") {
     bg = COLORS.warning;
     label = "System";
   }
@@ -1108,10 +1348,38 @@ function TypePill({ type }: { type: string }) {
     <span
       className="text-[0.65rem] font-semibold px-2 py-0.5 rounded-full"
       style={{ backgroundColor: bg, color: COLORS.textOnPrimary }}
-      title={type}
     >
       {label}
     </span>
+  );
+}
+
+function EmptyState({
+  title,
+  description,
+}: {
+  title: string;
+  description: string;
+}) {
+  return (
+    <div
+      className="rounded-2xl p-8 border text-center"
+      style={{
+        backgroundColor: COLORS.cardBg,
+        borderColor: COLORS.cardBorder,
+        boxShadow: `0 16px 30px ${COLORS.cardShadow}`,
+      }}
+    >
+      <div
+        className="text-sm font-semibold"
+        style={{ color: COLORS.textPrimary }}
+      >
+        {title}
+      </div>
+      <div className="text-xs mt-1" style={{ color: COLORS.textSecondary }}>
+        {description}
+      </div>
+    </div>
   );
 }
 
@@ -1191,7 +1459,19 @@ function NotificationItem({
   const isRead = !!n.is_read;
 
   const title = n.title.trim();
-  const preview = n.body ? truncate(n.body.trim(), 180) : "No message body.";
+  const preview = n.body ? truncate(n.body.trim(), 190) : "No message body.";
+
+  const kind = inferKind(n);
+  const actions = buildAdminActions(n);
+
+  const audienceKind = safeLower(n.audience) === "admin" ? "admin" : "customer";
+
+  // Useful metadata for admin, sourced from data if present
+  const event = tryGetString(n.data, "event");
+  const ticketNumber = tryGetString(n.data, "ticket_number");
+  const ticketId = tryGetString(n.data, "ticket_id");
+  const customerId = n.customer_id ?? tryGetString(n.data, "customer_id");
+  const raffleId = n.raffle_id ?? tryGetString(n.data, "raffle_id");
 
   return (
     <div
@@ -1212,10 +1492,10 @@ function NotificationItem({
           <div className="min-w-0">
             <div className="flex items-center gap-2 min-w-0">
               <Pill
-                label={safeLower(n.audience) === "admin" ? "Admin" : "Customer"}
-                kind={safeLower(n.audience) === "admin" ? "admin" : "customer"}
+                label={audienceKind === "admin" ? "Admin" : "Customer"}
+                kind={audienceKind}
               />
-              <TypePill type={n.type} />
+              <TypePill kind={kind} />
               <span
                 className="text-sm font-semibold truncate"
                 style={{ color: COLORS.textPrimary }}
@@ -1248,6 +1528,7 @@ function NotificationItem({
               style={{ color: COLORS.textMuted }}
             >
               <span>{relativeTime(n.created_at)}</span>
+
               <span>•</span>
               <button
                 type="button"
@@ -1255,31 +1536,61 @@ function NotificationItem({
                 onClick={() => copyToClipboard(n.id)}
                 title="Copy notification ID"
               >
-                Copy ID
+                Copy notif ID
               </button>
-              {n.customer_id && (
+
+              {event && (
+                <>
+                  <span>•</span>
+                  <span title="data.event">event: {event}</span>
+                </>
+              )}
+
+              {ticketNumber && (
+                <>
+                  <span>•</span>
+                  <span title="Ticket number">ticket: #{ticketNumber}</span>
+                </>
+              )}
+
+              {ticketId && (
+                <>
+                  <span>•</span>
+                  <button
+                    type="button"
+                    className="underline underline-offset-4"
+                    onClick={() => copyToClipboard(ticketId)}
+                    title="Copy ticket_id"
+                  >
+                    Copy ticket_id
+                  </button>
+                </>
+              )}
+
+              {customerId && (
                 <>
                   <span>•</span>
                   <Link
-                    href={`/customers/${n.customer_id}`}
+                    href={`/customers/${customerId}`}
                     className="underline underline-offset-4"
                     style={{ color: COLORS.primary }}
                     title="Open customer"
                   >
-                    Customer {n.customer_id.slice(0, 8)}…
+                    Customer {customerId.slice(0, 8)}…
                   </Link>
                 </>
               )}
-              {n.raffle_id && (
+
+              {raffleId && (
                 <>
                   <span>•</span>
                   <Link
-                    href={`/raffles/${n.raffle_id}`}
+                    href={`/raffles/${raffleId}`}
                     className="underline underline-offset-4"
                     style={{ color: COLORS.primary }}
                     title="Open raffle"
                   >
-                    Raffle {n.raffle_id.slice(0, 8)}…
+                    Raffle {raffleId.slice(0, 8)}…
                   </Link>
                 </>
               )}
@@ -1290,14 +1601,14 @@ function NotificationItem({
                 className="text-[0.7rem] mt-1"
                 style={{ color: COLORS.textMuted }}
               >
-                Read at: {new Date(n.read_at).toLocaleString("en-IE")}
+                Read at: {parseDateSafe(n.read_at).toLocaleString("en-IE")}
               </div>
             )}
           </div>
 
           <div className="flex flex-col items-end gap-2">
             <span className="text-[0.7rem]" style={{ color: COLORS.textMuted }}>
-              {new Date(n.created_at).toLocaleString("en-IE", {
+              {parseDateSafe(n.created_at).toLocaleString("en-IE", {
                 day: "2-digit",
                 month: "short",
                 hour: "2-digit",
@@ -1305,7 +1616,7 @@ function NotificationItem({
               })}
             </span>
 
-            <div className="flex gap-2">
+            <div className="flex gap-2 flex-wrap justify-end">
               <button
                 type="button"
                 disabled={busy}
@@ -1320,55 +1631,31 @@ function NotificationItem({
                 {isRead ? "Mark unread" : "Mark read"}
               </button>
 
-              {(n.customer_id || n.raffle_id) && (
+              {actions.map((a) => (
                 <Link
-                  href={
-                    n.raffle_id
-                      ? `/raffles/${n.raffle_id}`
-                      : `/customers/${n.customer_id}`
-                  }
+                  key={a.href + a.label}
+                  href={a.href}
                   className="px-2 py-1 rounded-lg text-[0.7rem] font-semibold border"
                   style={{
-                    borderColor: COLORS.primary,
-                    backgroundColor: COLORS.primary,
-                    color: COLORS.textOnPrimary,
+                    borderColor:
+                      a.variant === "primary"
+                        ? COLORS.primary
+                        : COLORS.cardBorder,
+                    backgroundColor:
+                      a.variant === "primary" ? COLORS.primary : COLORS.tabBg,
+                    color:
+                      a.variant === "primary"
+                        ? COLORS.textOnPrimary
+                        : COLORS.textPrimary,
                   }}
+                  title={a.title}
                 >
-                  Take action
+                  {a.label}
                 </Link>
-              )}
+              ))}
             </div>
           </div>
         </div>
-      </div>
-    </div>
-  );
-}
-
-function EmptyState({
-  title,
-  description,
-}: {
-  title: string;
-  description: string;
-}) {
-  return (
-    <div
-      className="rounded-2xl p-8 border text-center"
-      style={{
-        backgroundColor: COLORS.cardBg,
-        borderColor: COLORS.cardBorder,
-        boxShadow: `0 16px 30px ${COLORS.cardShadow}`,
-      }}
-    >
-      <div
-        className="text-sm font-semibold"
-        style={{ color: COLORS.textPrimary }}
-      >
-        {title}
-      </div>
-      <div className="text-xs mt-1" style={{ color: COLORS.textSecondary }}>
-        {description}
       </div>
     </div>
   );
