@@ -1051,7 +1051,7 @@ export default function NotificationsPage() {
                       className="text-[0.65rem] font-semibold px-2 py-0.5 rounded-full"
                       style={{
                         backgroundColor: COLORS.primary,
-                        color: COLORS.primary,
+                        color: COLORS.textOnPrimary,
                       }}
                     >
                       New
@@ -1318,7 +1318,7 @@ function Pill({ label, kind }: { label: string; kind: "customer" | "admin" }) {
       className="text-[0.65rem] font-semibold px-2 py-0.5 rounded-full"
       style={{
         backgroundColor: kind === "admin" ? COLORS.info : COLORS.tabActiveBg,
-        color: COLORS.textOnPrimary,
+        color: COLORS.primary,
       }}
     >
       {label}
