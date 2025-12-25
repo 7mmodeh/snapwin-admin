@@ -1051,7 +1051,7 @@ export default function NotificationsPage() {
                       className="text-[0.65rem] font-semibold px-2 py-0.5 rounded-full"
                       style={{
                         backgroundColor: COLORS.primary,
-                        color: COLORS.textOnPrimary,
+                        color: COLORS.primary,
                       }}
                     >
                       New
@@ -1347,7 +1347,7 @@ function TypePill({ kind }: { kind: KindFilter }) {
   return (
     <span
       className="text-[0.65rem] font-semibold px-2 py-0.5 rounded-full"
-      style={{ backgroundColor: bg, color: COLORS.primary }}
+      style={{ backgroundColor: bg, color: COLORS.textOnPrimary }}
     >
       {label}
     </span>
