@@ -1,4 +1,3 @@
-// app/(admin)/raffles/[id]/page.tsx
 "use client";
 
 import {
@@ -33,24 +32,24 @@ type RaffleDetail = {
   ticket_price: number | string;
   draw_date: string | null;
   winner_id: string | null;
-  winning_ticket_id: string | null; // ✅ audit
-  winning_ticket_number: number | null; // ✅ audit
+  winning_ticket_id: string | null;
+  winning_ticket_number: number | null;
   item_image_url: string | null;
   created_at: string;
   updated_at: string | null;
-  max_tickets_per_customer: number; // ✅
+  max_tickets_per_customer: number;
 };
 
 type TicketRow = {
   id: string;
-  ticket_code: string | null; // ✅ latest model
+  ticket_code: string | null;
   ticket_number: number;
   customer_id: string;
   payment_status: "pending" | "completed" | "failed" | string;
   is_winner: boolean | null;
   purchased_at: string | null;
   created_at: string | null;
-  payment_amount: number | null; // ✅ normalize to number for UI/math/export
+  payment_amount: number | null;
 };
 
 type WinnerCustomer = {
@@ -67,12 +66,40 @@ type DrawWinnerRpcResult = {
   winning_ticket_number: number | null;
 };
 
+type TicketsStatusFilter =
+  | "all"
+  | "completed"
+  | "pending"
+  | "failed"
+  | "winner";
+
 const RAFFLE_SELECT =
   "id, item_name, item_description, status, total_tickets, sold_tickets, ticket_price, draw_date, winner_id, winning_ticket_id, winning_ticket_number, item_image_url, created_at, updated_at, max_tickets_per_customer";
 
 const TICKETS_SELECT =
-  // include raffle_id only for query correctness / future use (doesn't change UI)
   "id, raffle_id, ticket_code, ticket_number, customer_id, payment_status, is_winner, purchased_at, created_at, payment_amount";
+
+function buildQuery(params: Record<string, string | undefined>) {
+  const s = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v != null && v !== "") s.set(k, v);
+  });
+  const q = s.toString();
+  return q ? `?${q}` : "";
+}
+
+function shortId(id: string | null | undefined) {
+  if (!id) return "—";
+  return id.length <= 10 ? id : `${id.slice(0, 8)}…`;
+}
+
+async function copyToClipboard(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // no-op
+  }
+}
 
 function isDrawWinnerRpcResult(v: unknown): v is DrawWinnerRpcResult {
   if (typeof v !== "object" || v === null) return false;
@@ -109,6 +136,11 @@ function coerceNumber(v: unknown): number | null {
   return null;
 }
 
+function formatAmount(amount: number): string {
+  if (!Number.isFinite(amount)) return "-";
+  return amount.toFixed(2);
+}
+
 export default function RaffleDetailPage() {
   const params = useParams();
   const router = useRouter();
@@ -139,6 +171,10 @@ export default function RaffleDetailPage() {
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const [imageSaving, setImageSaving] = useState(false);
+
+  // Ticket UX controls
+  const [ticketFilter, setTicketFilter] = useState<TicketsStatusFilter>("all");
+  const [ticketSearch, setTicketSearch] = useState("");
 
   useEffect(() => {
     return () => {
@@ -359,6 +395,31 @@ export default function RaffleDetailPage() {
     };
   }, [raffle, tickets]);
 
+  const filteredTickets = useMemo(() => {
+    let res = [...tickets];
+
+    if (ticketFilter === "winner") res = res.filter((t) => !!t.is_winner);
+    else if (ticketFilter !== "all")
+      res = res.filter((t) => String(t.payment_status) === ticketFilter);
+
+    const q = ticketSearch.trim().toLowerCase();
+    if (q) {
+      res = res.filter((t) => {
+        const code = (t.ticket_code ?? "").toLowerCase();
+        const id = t.id.toLowerCase();
+        const cust = t.customer_id.toLowerCase();
+        return (
+          code.includes(q) ||
+          id.includes(q) ||
+          cust.includes(q) ||
+          String(t.ticket_number).includes(q)
+        );
+      });
+    }
+
+    return res;
+  }, [tickets, ticketFilter, ticketSearch]);
+
   const handleSave = async () => {
     if (!raffle) return;
 
@@ -525,7 +586,6 @@ export default function RaffleDetailPage() {
         setWinner(null);
       }
 
-      // refresh tickets (avoid generic .select<...> typing issues)
       const ticketsRes = await supabase
         .from("tickets")
         .select(TICKETS_SELECT)
@@ -659,6 +719,7 @@ export default function RaffleDetailPage() {
       "created_at",
       "payment_amount",
       "customer_id",
+      "ticket_id",
     ];
 
     const rows = tickets.map((t) => [
@@ -670,6 +731,7 @@ export default function RaffleDetailPage() {
       t.created_at ? new Date(t.created_at).toISOString() : "",
       t.payment_amount ?? "",
       t.customer_id,
+      t.id,
     ]);
 
     const csvContent =
@@ -787,9 +849,20 @@ export default function RaffleDetailPage() {
 
         <div className="flex flex-col items-start md:items-end gap-2">
           <StatusBadge status={raffle.status} />
-          <span className="text-xs" style={{ color: COLORS.textSecondary }}>
-            Raffle ID: {raffle.id}
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="text-xs" style={{ color: COLORS.textSecondary }}>
+              Raffle ID: {raffle.id}
+            </span>
+            <button
+              type="button"
+              onClick={() => copyToClipboard(raffle.id)}
+              className="text-[0.7rem] underline"
+              style={{ color: COLORS.primary }}
+            >
+              Copy
+            </button>
+          </div>
+
           <div className="flex flex-wrap gap-2 mt-1">
             <Link
               href={`/raffles/${raffle.id}/edit`}
@@ -812,6 +885,18 @@ export default function RaffleDetailPage() {
               }}
             >
               Manage questions
+            </Link>
+            <Link
+              href={`/tickets${buildQuery({ raffle_id: raffle.id })}`}
+              className="px-3 py-1.5 rounded-full text-xs font-medium border"
+              style={{
+                borderColor: COLORS.cardBorder,
+                backgroundColor: COLORS.highlightCardBg,
+                color: COLORS.textPrimary,
+              }}
+              title="Open tickets list filtered by this raffle"
+            >
+              Open in Tickets
             </Link>
           </div>
         </div>
@@ -1036,7 +1121,6 @@ export default function RaffleDetailPage() {
             </button>
           </div>
 
-          {/* Save controls */}
           <button
             type="button"
             onClick={fetchDetail}
@@ -1088,17 +1172,20 @@ export default function RaffleDetailPage() {
           </p>
         ) : winner ? (
           <div className="space-y-1 text-sm">
-            <div>
-              <span
-                className="font-medium"
-                style={{ color: COLORS.textPrimary }}
+            <div className="flex items-center gap-2">
+              <Link
+                href={`/customers/${winner.id}`}
+                className="font-semibold underline"
+                style={{ color: COLORS.primary }}
+                title="Open customer"
               >
                 {winner.name}
-              </span>{" "}
+              </Link>
               <span style={{ color: COLORS.textSecondary }}>
                 ({winner.email})
               </span>
             </div>
+
             <div style={{ color: COLORS.textSecondary }}>
               {winner.phone && <>Phone: {winner.phone} · </>}
               {winner.county && <>County: {winner.county}</>}
@@ -1130,7 +1217,7 @@ export default function RaffleDetailPage() {
         }}
       >
         <div
-          className="p-4 border-b flex items-center justify-between gap-2"
+          className="p-4 border-b flex flex-col md:flex-row md:items-center md:justify-between gap-3"
           style={{ borderColor: COLORS.cardBorder }}
         >
           <div>
@@ -1141,29 +1228,64 @@ export default function RaffleDetailPage() {
               Tickets
             </h2>
             <p className="text-xs mt-1" style={{ color: COLORS.textSecondary }}>
-              All tickets for this raffle (includes pending, completed and
-              failed).
+              Click a row to drill into Tickets list. Use quick actions for
+              Customer/Raffle navigation.
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={handleExportTickets}
-            disabled={!tickets.length}
-            className="px-3 py-2 rounded text-xs font-medium"
-            style={{
-              backgroundColor: COLORS.secondaryButtonBg,
-              color: COLORS.secondaryButtonText,
-              opacity: tickets.length ? 1 : 0.5,
-            }}
-          >
-            Export tickets CSV
-          </button>
+          <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
+            <select
+              value={ticketFilter}
+              onChange={(e) =>
+                setTicketFilter(e.target.value as TicketsStatusFilter)
+              }
+              className="border rounded-xl px-3 py-2 text-xs"
+              style={{
+                borderColor: COLORS.inputBorder,
+                backgroundColor: COLORS.inputBg,
+                color: COLORS.textPrimary,
+              }}
+              title="Filter tickets"
+            >
+              <option value="all">All</option>
+              <option value="completed">Completed</option>
+              <option value="pending">Pending</option>
+              <option value="failed">Failed</option>
+              <option value="winner">Winners</option>
+            </select>
+
+            <input
+              value={ticketSearch}
+              onChange={(e) => setTicketSearch(e.target.value)}
+              placeholder="Search code, ticket #, customer id…"
+              className="border rounded-xl px-3 py-2 text-xs w-full sm:w-72"
+              style={{
+                borderColor: COLORS.inputBorder,
+                backgroundColor: COLORS.inputBg,
+                color: COLORS.textPrimary,
+              }}
+            />
+
+            <button
+              type="button"
+              onClick={handleExportTickets}
+              disabled={!tickets.length}
+              className="px-3 py-2 rounded-xl text-xs font-semibold border"
+              style={{
+                backgroundColor: COLORS.secondaryButtonBg,
+                color: COLORS.secondaryButtonText,
+                borderColor: COLORS.cardBorder,
+                opacity: tickets.length ? 1 : 0.5,
+              }}
+            >
+              Export tickets CSV
+            </button>
+          </div>
         </div>
 
-        {tickets.length === 0 ? (
+        {filteredTickets.length === 0 ? (
           <div className="p-4" style={{ color: COLORS.textMuted }}>
-            No tickets found for this raffle.
+            No tickets match the current filters.
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -1175,101 +1297,187 @@ export default function RaffleDetailPage() {
                 }}
               >
                 <tr>
-                  <th className="px-3 py-2 text-left">Ticket code</th>
-                  <th className="px-3 py-2 text-left">Ticket #</th>
-                  <th className="px-3 py-2 text-left">Payment status</th>
+                  <th className="px-3 py-2 text-left">Ticket</th>
+                  <th className="px-3 py-2 text-left">Status</th>
                   <th className="px-3 py-2 text-left">Winner</th>
-                  <th className="px-3 py-2 text-left">Purchased at</th>
+                  <th className="px-3 py-2 text-left">Purchased</th>
                   <th className="px-3 py-2 text-right">Amount</th>
-                  <th className="px-3 py-2 text-left">Customer ID</th>
+                  <th className="px-3 py-2 text-left">Customer</th>
+                  <th className="px-3 py-2 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {tickets.map((t) => (
-                  <tr
-                    key={t.id}
-                    className="border-t"
-                    style={{ borderColor: COLORS.cardBorder }}
-                  >
-                    <td className="px-3 py-2 align-top">
-                      <span
-                        style={{
-                          color: COLORS.textSecondary,
-                          fontSize: "0.75rem",
-                        }}
-                      >
-                        {t.ticket_code ?? "-"}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2 align-top">
-                      <span style={{ color: COLORS.textPrimary }}>
-                        {t.ticket_number}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2 align-top">
-                      <TicketStatusBadge status={t.payment_status} />
-                    </td>
-                    <td className="px-3 py-2 align-top">
-                      {t.is_winner ? (
-                        <span
-                          className="px-2 py-1 rounded-full text-[0.65rem] font-semibold"
-                          style={{
-                            backgroundColor: COLORS.success,
-                            color: COLORS.textOnPrimary,
-                          }}
+                {filteredTickets.map((t) => {
+                  const rowHref = `/tickets${buildQuery({
+                    raffle_id: raffle.id,
+                    customer_id: t.customer_id,
+                    status:
+                      t.payment_status === "completed" ||
+                      t.payment_status === "pending" ||
+                      t.payment_status === "failed"
+                        ? String(t.payment_status)
+                        : undefined,
+                  })}`;
+
+                  return (
+                    <tr
+                      key={t.id}
+                      className="border-t hover:bg-gray-50 transition-colors"
+                      style={{ borderColor: COLORS.cardBorder }}
+                    >
+                      <td className="px-3 py-2 align-top">
+                        <Link
+                          href={rowHref}
+                          className="block rounded-lg p-2 -m-2"
+                          style={{ color: COLORS.textPrimary }}
+                          title="Open Tickets list with filters"
                         >
-                          Winner
-                        </span>
-                      ) : (
+                          <div className="flex items-center gap-2">
+                            <span className="font-semibold">
+                              #{t.ticket_number}
+                            </span>
+                            {t.ticket_code ? (
+                              <span
+                                className="px-2 py-0.5 rounded-full text-[0.65rem] font-semibold border"
+                                style={{
+                                  backgroundColor: COLORS.tabBg,
+                                  borderColor: COLORS.tabBorder,
+                                  color: COLORS.textSecondary,
+                                }}
+                              >
+                                {t.ticket_code}
+                              </span>
+                            ) : (
+                              <span
+                                className="text-[0.7rem]"
+                                style={{ color: COLORS.textMuted }}
+                              >
+                                No code
+                              </span>
+                            )}
+                          </div>
+
+                          <div
+                            className="mt-1 text-[0.7rem]"
+                            style={{ color: COLORS.textMuted }}
+                          >
+                            Ticket ID: {shortId(t.id)}
+                          </div>
+                        </Link>
+                      </td>
+
+                      <td className="px-3 py-2 align-top">
+                        <TicketStatusBadge status={t.payment_status} />
+                      </td>
+
+                      <td className="px-3 py-2 align-top">
+                        {t.is_winner ? (
+                          <span
+                            className="px-2 py-1 rounded-full text-[0.65rem] font-semibold"
+                            style={{
+                              backgroundColor: COLORS.success,
+                              color: COLORS.textOnPrimary,
+                            }}
+                          >
+                            Winner
+                          </span>
+                        ) : (
+                          <span style={{ color: COLORS.textMuted }}>—</span>
+                        )}
+                      </td>
+
+                      <td className="px-3 py-2 align-top">
                         <span
                           style={{
-                            color: COLORS.textMuted,
+                            color: COLORS.textSecondary,
                             fontSize: "0.75rem",
                           }}
                         >
-                          -
+                          {t.purchased_at
+                            ? new Date(t.purchased_at).toLocaleString("en-IE")
+                            : "-"}
                         </span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2 align-top">
-                      <span
-                        style={{
-                          color: COLORS.textSecondary,
-                          fontSize: "0.75rem",
-                        }}
-                      >
-                        {t.purchased_at
-                          ? new Date(t.purchased_at).toLocaleString("en-IE")
-                          : "-"}
-                      </span>
-                      <div
-                        style={{ color: COLORS.textMuted, fontSize: "0.7rem" }}
-                      >
-                        Created:{" "}
-                        {t.created_at
-                          ? new Date(t.created_at).toLocaleString("en-IE")
-                          : "-"}
-                      </div>
-                    </td>
-                    <td className="px-3 py-2 align-top text-right">
-                      <span style={{ color: COLORS.textPrimary }}>
-                        {t.payment_amount != null
-                          ? `€${formatAmount(t.payment_amount)}`
-                          : "-"}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2 align-top">
-                      <span
-                        style={{
-                          color: COLORS.textSecondary,
-                          fontSize: "0.75rem",
-                        }}
-                      >
-                        {t.customer_id}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
+                        <div
+                          style={{
+                            color: COLORS.textMuted,
+                            fontSize: "0.7rem",
+                          }}
+                        >
+                          Created:{" "}
+                          {t.created_at
+                            ? new Date(t.created_at).toLocaleString("en-IE")
+                            : "-"}
+                        </div>
+                      </td>
+
+                      <td className="px-3 py-2 align-top text-right">
+                        <span style={{ color: COLORS.textPrimary }}>
+                          {t.payment_amount != null
+                            ? `€${formatAmount(t.payment_amount)}`
+                            : "-"}
+                        </span>
+                      </td>
+
+                      <td className="px-3 py-2 align-top">
+                        <div className="flex items-center gap-2">
+                          <Link
+                            href={`/customers/${t.customer_id}`}
+                            className="underline text-[0.75rem]"
+                            style={{ color: COLORS.primary }}
+                            title="Open customer"
+                          >
+                            {shortId(t.customer_id)}
+                          </Link>
+                          <button
+                            type="button"
+                            onClick={() => copyToClipboard(t.customer_id)}
+                            className="text-[0.7rem] underline"
+                            style={{ color: COLORS.textSecondary }}
+                            title="Copy customer ID"
+                          >
+                            Copy
+                          </button>
+                        </div>
+                      </td>
+
+                      <td className="px-3 py-2 align-top text-right">
+                        <div className="flex items-center justify-end gap-2">
+                          <Link
+                            href={`/tickets${buildQuery({
+                              raffle_id: raffle.id,
+                              customer_id: t.customer_id,
+                            })}`}
+                            className="px-2 py-1 rounded-lg text-[0.7rem] font-semibold border"
+                            style={{
+                              borderColor: COLORS.cardBorder,
+                              backgroundColor: COLORS.highlightCardBg,
+                              color: COLORS.textPrimary,
+                            }}
+                            title="Open in tickets list"
+                          >
+                            View
+                          </Link>
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              copyToClipboard(t.ticket_code ?? t.id)
+                            }
+                            className="px-2 py-1 rounded-lg text-[0.7rem] font-semibold border"
+                            style={{
+                              borderColor: COLORS.cardBorder,
+                              backgroundColor: COLORS.tabBg,
+                              color: COLORS.textPrimary,
+                            }}
+                            title="Copy ticket code (or ticket id)"
+                          >
+                            Copy
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -1364,12 +1572,15 @@ function TicketStatusBadge({
   } else if (status === "failed") {
     bg = COLORS.error;
     label = "Failed";
+  } else if (!label) {
+    label = "Unknown";
   }
 
   return (
     <span
       className="px-2 py-1 rounded-full text-[0.65rem] font-semibold"
       style={{ backgroundColor: bg, color: COLORS.textOnPrimary }}
+      title={`payment_status: ${label}`}
     >
       {label}
     </span>
@@ -1387,9 +1598,4 @@ function toDateTimeLocalValue(isoString: string): string {
   const minutes = pad(d.getMinutes());
 
   return `${year}-${month}-${day}T${hours}:${minutes}`;
-}
-
-function formatAmount(amount: number): string {
-  if (!Number.isFinite(amount)) return "-";
-  return amount.toFixed(2);
 }

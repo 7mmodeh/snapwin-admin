@@ -3,13 +3,12 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import type { PostgrestError, RealtimeChannel } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
 
 type PaymentStatus = "pending" | "completed" | "failed";
-
 type OneOrMany<T> = T | T[] | null;
 
 type TicketDetail = {
@@ -44,8 +43,6 @@ type TicketDetail = {
 };
 
 type TicketDetailRaw = Omit<TicketDetail, "raffles" | "customers"> & {
-  // With explicit FK pinning + aliasing, these come back as *single objects* (or null),
-  // but we still accept OneOrMany for safety across environments.
   raffles?: OneOrMany<{
     id: string;
     item_name: string;
@@ -114,14 +111,22 @@ function kv(label: string, value: React.ReactNode) {
 export default function AdminTicketDetailPage() {
   const params = useParams();
   const router = useRouter();
+  const searchParams = useSearchParams();
+
   const rawId = (params as { id?: string | string[] }).id;
   const ticketId = Array.isArray(rawId) ? rawId[0] : rawId;
+
+  // Preserve list filters when going “Back to tickets”
+  const backToTicketsHref = useMemo(() => {
+    const sp = new URLSearchParams(searchParams.toString());
+    const qs = sp.toString();
+    return qs ? `/tickets?${qs}` : "/tickets";
+  }, [searchParams]);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [ticket, setTicket] = useState<TicketDetail | null>(null);
 
-  // Throttle realtime bursts
   const rtTimerRef = useRef<number | null>(null);
 
   const fetchTicket = useCallback(async () => {
@@ -131,13 +136,6 @@ export default function AdminTicketDetailPage() {
       setLoading(true);
       setError(null);
 
-      // ✅ IMPORTANT: pin the FK relationships explicitly to avoid PGRST201 ambiguity
-      // - tickets -> raffles can be ambiguous if raffles has winning_ticket_id etc.
-      // - use FK names from Supabase hint:
-      //   raffles!tickets_raffle_id_fkey
-      //   customers!tickets_customer_id_fkey
-      //
-      // Keep the original property names (raffles/customers) so the rest of the file is unchanged.
       const { data, error: qErr } = await supabase
         .from("tickets")
         .select(
@@ -172,7 +170,6 @@ export default function AdminTicketDetailPage() {
         return;
       }
 
-      // Normalize amount (safety) + nested relations (object vs array)
       const normalized: TicketDetail = {
         ...data,
         payment_amount: toNumberOrNull(data.payment_amount),
@@ -202,7 +199,6 @@ export default function AdminTicketDetailPage() {
     fetchTicket();
   }, [fetchTicket]);
 
-  // Optional realtime refresh: if the ticket changes, re-fetch
   useEffect(() => {
     if (!ticketId) return;
 
@@ -316,14 +312,13 @@ export default function AdminTicketDetailPage() {
       {/* Header */}
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
         <div>
-          <button
-            type="button"
-            onClick={() => router.back()}
-            className="text-sm underline mb-2"
+          <Link
+            href={backToTicketsHref}
+            className="text-sm underline mb-2 inline-block"
             style={{ color: COLORS.primary }}
           >
             ← Back to tickets
-          </button>
+          </Link>
 
           <div className="flex items-center gap-3 flex-wrap">
             <h1

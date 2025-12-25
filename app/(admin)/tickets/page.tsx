@@ -3,6 +3,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import type { PostgrestError, RealtimeChannel } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
@@ -185,6 +186,9 @@ async function lookupRaffleIdsByItemName(
 }
 
 export default function AdminTicketsPage() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
 
@@ -280,6 +284,58 @@ export default function AdminTicketsPage() {
     const pages = Math.ceil((totalCount || 0) / PAGE_SIZE);
     return Math.max(1, pages);
   }, [totalCount]);
+
+  // -----------------------------
+  // URL -> State hydration (raffle_id, customer_id, status)
+  // -----------------------------
+  const hydratedFromUrlRef = useRef(false);
+  useEffect(() => {
+    if (hydratedFromUrlRef.current) return;
+
+    const qpStatus = (searchParams.get("status") || "").trim().toLowerCase();
+    const qpRaffleId = (searchParams.get("raffle_id") || "").trim();
+    const qpCustomerId = (searchParams.get("customer_id") || "").trim();
+
+    if (qpStatus && isStatusFilter(qpStatus)) setStatus(qpStatus);
+    if (qpRaffleId) setRaffleId(qpRaffleId);
+    if (qpCustomerId) setCustomerId(qpCustomerId);
+
+    hydratedFromUrlRef.current = true;
+  }, [searchParams]);
+
+  // -----------------------------
+  // State -> URL sync (only these 3 params)
+  // -----------------------------
+  const lastUrlKeyRef = useRef<string>("");
+  useEffect(() => {
+    if (!hydratedFromUrlRef.current) return;
+
+    const sp = new URLSearchParams(searchParams.toString());
+
+    // status
+    if (status && status !== "all") sp.set("status", status);
+    else sp.delete("status");
+
+    // raffle_id
+    const r = raffleId.trim();
+    if (r) sp.set("raffle_id", r);
+    else sp.delete("raffle_id");
+
+    // customer_id
+    const c = customerId.trim();
+    if (c) sp.set("customer_id", c);
+    else sp.delete("customer_id");
+
+    const nextQs = sp.toString();
+    const key = `${status}|${r}|${c}|${nextQs}`;
+
+    if (key === lastUrlKeyRef.current) return;
+    lastUrlKeyRef.current = key;
+
+    const url = nextQs ? `/tickets?${nextQs}` : "/tickets";
+    router.replace(url, { scroll: false });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, raffleId, customerId, router]);
 
   // Reset to page 1 when filters change
   useEffect(() => {
@@ -419,7 +475,6 @@ export default function AdminTicketsPage() {
           50
         );
 
-        // If user typed a customer search and no customers match, we can short-circuit.
         if (customerIdsFromLookup.length === 0) {
           setRows([]);
           setTotalCount(0);
@@ -533,7 +588,6 @@ export default function AdminTicketsPage() {
 
       // ---- Has Stripe refs only
       if (hasStripeRefsOnly) {
-        // Require at least one of PI or CS
         query = query.or(
           "payment_intent_id.not.is.null,checkout_session_id.not.is.null"
         );
@@ -544,26 +598,23 @@ export default function AdminTicketsPage() {
         query = query.or("ticket_code.is.null,ticket_code.eq.");
       }
 
-      // ---- Time filters (created_at vs payment_completed_at)
+      // ---- Time filters
       const tf: TimeField = timeField;
 
       if (dateFrom) {
-        // Interpret yyyy-mm-dd local start-of-day, but send ISO
         const d = new Date(`${dateFrom}T00:00:00`);
         query = query.gte(tf, d.toISOString());
       }
       if (dateTo) {
-        // Interpret yyyy-mm-dd local end-of-day
         const d = new Date(`${dateTo}T23:59:59.999`);
         query = query.lte(tf, d.toISOString());
       }
 
-      // ---- Pending older than N minutes (forensics)
+      // ---- Pending older than N minutes
       const pendingMinutes = pendingOlderThanMinutes.trim()
         ? parseInt(pendingOlderThanMinutes.trim(), 10)
         : NaN;
       if (!Number.isNaN(pendingMinutes) && pendingMinutes > 0) {
-        // This filter is meaningful primarily for pending
         query = query.eq("payment_status", "pending");
         query = query.lte(tf, isoMinusMinutes(pendingMinutes));
       }
@@ -585,10 +636,7 @@ export default function AdminTicketsPage() {
 
       // ---- Error filter (ilike)
       const eqry = errorQuery.trim();
-      if (eqry) {
-        // Typically used with failed; we won’t force status but you can if you want.
-        query = query.ilike("payment_error", `%${escapeIlike(eqry)}%`);
-      }
+      if (eqry) query = query.ilike("payment_error", `%${escapeIlike(eqry)}%`);
 
       // Fetch
       const res = await query.range(from, to);
@@ -713,6 +761,16 @@ export default function AdminTicketsPage() {
     }
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [rows]);
+
+  // Preserve current list filters when navigating into /tickets/[id]
+  const ticketListQs = useMemo(() => {
+    const sp = new URLSearchParams();
+    if (status !== "all") sp.set("status", status);
+    if (raffleId.trim()) sp.set("raffle_id", raffleId.trim());
+    if (customerId.trim()) sp.set("customer_id", customerId.trim());
+    const qs = sp.toString();
+    return qs ? `?${qs}` : "";
+  }, [status, raffleId, customerId]);
 
   return (
     <div className="space-y-6">
@@ -1564,7 +1622,7 @@ export default function AdminTicketsPage() {
                       <td className="px-5 py-4">
                         <div className="flex flex-col gap-1">
                           <Link
-                            href={`/tickets/${t.id}`}
+                            href={`/tickets/${t.id}${ticketListQs}`}
                             className="font-semibold underline"
                             style={{ color: COLORS.primary }}
                           >
@@ -1794,6 +1852,10 @@ export default function AdminTicketsPage() {
             Stripe refs.
           </li>
           <li>Realtime refresh on any ticket insert/update/delete.</li>
+          <li>
+            URL params supported: <code>status</code>, <code>raffle_id</code>,{" "}
+            <code>customer_id</code>.
+          </li>
         </ul>
       </div>
     </div>

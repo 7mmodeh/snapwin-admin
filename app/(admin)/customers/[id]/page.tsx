@@ -1,4 +1,3 @@
-// app/(admin)/customers/[id]/page.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
@@ -30,6 +29,8 @@ type CustomerTicket = {
   is_winner: boolean | null;
   purchased_at: string | null;
   payment_amount: number | null; // ✅ normalized
+
+  raffle: { id: string; item_name: string } | null; // ✅ show raffle name + link
 };
 
 type CustomerDetailRaw = Record<string, unknown>;
@@ -57,6 +58,23 @@ function toNumberOrNull(v: unknown): number | null {
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
   const n = parseFloat(String(v));
   return Number.isNaN(n) ? null : n;
+}
+
+function isObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+
+function toRaffleSummary(v: unknown): CustomerTicket["raffle"] {
+  if (!isObj(v)) return null;
+  const id = typeof v.id === "string" ? v.id : null;
+  const item_name = typeof v.item_name === "string" ? v.item_name : null;
+  if (!id || !item_name) return null;
+  return { id, item_name };
+}
+
+function shortId(id?: string | null) {
+  if (!id) return "—";
+  return id.length > 10 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
 }
 
 function normalizeCustomer(raw: CustomerDetailRaw): CustomerDetail | null {
@@ -107,12 +125,71 @@ function normalizeTicket(raw: CustomerTicketRaw): CustomerTicket | null {
         : (raw.is_winner as boolean | null) ?? null,
     purchased_at: toStringOrNull(raw.purchased_at),
     payment_amount: toNumberOrNull(raw.payment_amount),
+    raffle: toRaffleSummary((raw as Record<string, unknown>).raffle),
   };
 }
 
 function formatAmount(amount: number | null): string {
   if (amount == null || !Number.isFinite(amount)) return "-";
   return amount.toFixed(2);
+}
+
+function stopRowNav(e: React.SyntheticEvent) {
+  e.stopPropagation();
+}
+
+function CopyButton({
+  value,
+  label = "Copy",
+  className = "",
+}: {
+  value: string;
+  label?: string;
+  className?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  const onCopy = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 900);
+    } catch {
+      // fallback
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = value;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 900);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={onCopy}
+      className={`px-2 py-1 rounded border text-[0.7rem] font-medium ${className}`}
+      style={{
+        borderColor: COLORS.cardBorder,
+        backgroundColor: COLORS.cardBg,
+        color: copied ? COLORS.success : COLORS.textSecondary,
+      }}
+      title={value}
+    >
+      {copied ? "Copied" : label}
+    </button>
+  );
 }
 
 export default function CustomerDetailPage() {
@@ -146,7 +223,18 @@ export default function CustomerDetailPage() {
         supabase
           .from("tickets")
           .select(
-            "id, raffle_id, customer_id, ticket_number, ticket_code, payment_status, is_winner, purchased_at, payment_amount"
+            `
+              id,
+              raffle_id,
+              customer_id,
+              ticket_number,
+              ticket_code,
+              payment_status,
+              is_winner,
+              purchased_at,
+              payment_amount,
+              raffle:raffles!tickets_raffle_id_fkey ( id, item_name )
+            `
           )
           .eq("customer_id", customerId)
           .order("purchased_at", { ascending: false }),
@@ -202,7 +290,7 @@ export default function CustomerDetailPage() {
     fetchDetail();
   }, [fetchDetail]);
 
-  // Optional realtime refresh (keeps this page consistent with tickets/raffles pages)
+  // Optional realtime refresh
   useEffect(() => {
     if (!customerId) return;
 
@@ -269,7 +357,7 @@ export default function CustomerDetailPage() {
     };
   }, [tickets]);
 
-  // Export this customer's tickets as CSV
+  // Export tickets as CSV
   const handleExportTickets = () => {
     if (!tickets.length || !customer) return;
 
@@ -308,9 +396,7 @@ export default function CustomerDetailPage() {
         )
         .join("\n") + "\n";
 
-    const blob = new Blob([csvContent], {
-      type: "text/csv;charset=utf-8;",
-    });
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
 
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -326,6 +412,9 @@ export default function CustomerDetailPage() {
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
   };
+
+  const goTicket = (ticketId: string) => router.push(`/tickets/${ticketId}`);
+  const goRaffle = (raffleId: string) => router.push(`/raffles/${raffleId}`);
 
   if (loading) {
     return (
@@ -381,19 +470,28 @@ export default function CustomerDetailPage() {
             {customer.name}
           </h1>
           <p style={{ color: COLORS.textSecondary }}>{customer.email}</p>
+
+          <div className="flex flex-wrap gap-2 mt-2">
+            <CopyButton value={customer.id} label="Copy Customer ID" />
+            {customer.stripe_customer_id ? (
+              <CopyButton
+                value={customer.stripe_customer_id}
+                label="Copy Stripe Customer ID"
+              />
+            ) : null}
+          </div>
         </div>
 
         <div className="flex flex-col items-start md:items-end gap-2">
           <span className="text-xs" style={{ color: COLORS.textSecondary }}>
-            Customer ID: {customer.id}
+            Customer ID: {shortId(customer.id)}
           </span>
           {customer.stripe_customer_id && (
             <span className="text-xs" style={{ color: COLORS.textSecondary }}>
-              Stripe ID: {customer.stripe_customer_id}
+              Stripe ID: {shortId(customer.stripe_customer_id)}
             </span>
           )}
 
-          {/* Export button */}
           <button
             type="button"
             onClick={handleExportTickets}
@@ -419,6 +517,7 @@ export default function CustomerDetailPage() {
             backgroundColor: COLORS.cardBg,
             borderColor: COLORS.cardBorder,
             borderWidth: 1,
+            boxShadow: `0 12px 28px ${COLORS.cardShadow}`,
           }}
         >
           <h2
@@ -448,6 +547,7 @@ export default function CustomerDetailPage() {
             backgroundColor: COLORS.cardBg,
             borderColor: COLORS.cardBorder,
             borderWidth: 1,
+            boxShadow: `0 12px 28px ${COLORS.cardShadow}`,
           }}
         >
           <h2
@@ -484,6 +584,7 @@ export default function CustomerDetailPage() {
           backgroundColor: COLORS.cardBg,
           borderColor: COLORS.cardBorder,
           borderWidth: 1,
+          boxShadow: `0 18px 40px ${COLORS.cardShadow}`,
         }}
       >
         <div
@@ -497,7 +598,8 @@ export default function CustomerDetailPage() {
             Tickets
           </h2>
           <p className="text-xs mt-1" style={{ color: COLORS.textSecondary }}>
-            All tickets purchased by this customer.
+            Click any row to open the ticket record. Raffle names also link
+            directly.
           </p>
         </div>
 
@@ -516,24 +618,50 @@ export default function CustomerDetailPage() {
               >
                 <tr>
                   <th className="px-3 py-2 text-left">Ticket</th>
-                  <th className="px-3 py-2 text-left">Payment status</th>
+                  <th className="px-3 py-2 text-left">Raffle</th>
+                  <th className="px-3 py-2 text-left">Payment</th>
                   <th className="px-3 py-2 text-left">Winner</th>
-                  <th className="px-3 py-2 text-left">Raffle ID</th>
-                  <th className="px-3 py-2 text-left">Purchased at</th>
+                  <th className="px-3 py-2 text-left">Purchased</th>
                   <th className="px-3 py-2 text-right">Amount</th>
+                  <th className="px-3 py-2 text-left">Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {tickets.map((t) => (
                   <tr
                     key={t.id}
-                    className="border-t"
-                    style={{ borderColor: COLORS.cardBorder }}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => goTicket(t.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") goTicket(t.id);
+                    }}
+                    className="border-t transition"
+                    style={{
+                      borderColor: COLORS.cardBorder,
+                      cursor: "pointer",
+                    }}
+                    onMouseEnter={(e) => {
+                      (
+                        e.currentTarget as HTMLTableRowElement
+                      ).style.backgroundColor = COLORS.highlightCardBg;
+                    }}
+                    onMouseLeave={(e) => {
+                      (
+                        e.currentTarget as HTMLTableRowElement
+                      ).style.backgroundColor = "transparent";
+                    }}
                   >
                     <td className="px-3 py-2 align-top">
                       <div className="flex flex-col">
                         <span style={{ color: COLORS.textPrimary }}>
                           #{t.ticket_number}
+                          {t.is_winner ? (
+                            <span style={{ color: COLORS.success }}>
+                              {" "}
+                              • WIN
+                            </span>
+                          ) : null}
                         </span>
                         <span
                           style={{
@@ -543,11 +671,45 @@ export default function CustomerDetailPage() {
                         >
                           Code: {t.ticket_code ?? "-"}
                         </span>
+                        <span
+                          style={{
+                            color: COLORS.textMuted,
+                            fontSize: "0.7rem",
+                          }}
+                        >
+                          ID: {shortId(t.id)}
+                        </span>
                       </div>
                     </td>
+
+                    <td className="px-3 py-2 align-top">
+                      <div className="flex flex-col">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            stopRowNav(e);
+                            goRaffle(t.raffle_id);
+                          }}
+                          className="text-left underline font-medium"
+                          style={{ color: COLORS.primary }}
+                        >
+                          {t.raffle?.item_name ?? "Open raffle"}
+                        </button>
+                        <span
+                          style={{
+                            color: COLORS.textMuted,
+                            fontSize: "0.7rem",
+                          }}
+                        >
+                          {shortId(t.raffle_id)}
+                        </span>
+                      </div>
+                    </td>
+
                     <td className="px-3 py-2 align-top">
                       <TicketStatusBadge status={t.payment_status} />
                     </td>
+
                     <td className="px-3 py-2 align-top">
                       {t.is_winner ? (
                         <span
@@ -570,16 +732,7 @@ export default function CustomerDetailPage() {
                         </span>
                       )}
                     </td>
-                    <td className="px-3 py-2 align-top">
-                      <span
-                        style={{
-                          color: COLORS.textSecondary,
-                          fontSize: "0.75rem",
-                        }}
-                      >
-                        {t.raffle_id}
-                      </span>
-                    </td>
+
                     <td className="px-3 py-2 align-top">
                       <span
                         style={{
@@ -592,12 +745,22 @@ export default function CustomerDetailPage() {
                           : "-"}
                       </span>
                     </td>
+
                     <td className="px-3 py-2 align-top text-right">
                       <span style={{ color: COLORS.textPrimary }}>
                         {t.payment_amount != null
                           ? `€${formatAmount(t.payment_amount)}`
                           : "-"}
                       </span>
+                    </td>
+
+                    <td className="px-3 py-2 align-top">
+                      <div className="flex flex-wrap gap-2">
+                        <CopyButton value={t.id} label="Copy Ticket ID" />
+                        {t.ticket_code ? (
+                          <CopyButton value={t.ticket_code} label="Copy Code" />
+                        ) : null}
+                      </div>
                     </td>
                   </tr>
                 ))}
