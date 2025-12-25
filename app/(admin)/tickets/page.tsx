@@ -8,11 +8,14 @@ import type { PostgrestError, RealtimeChannel } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
 
+/* -------------------------------- Types --------------------------------- */
+
 type PaymentStatus = "pending" | "completed" | "failed";
 type StatusFilter = PaymentStatus | "all";
 
 type MatchMode = "contains" | "starts" | "exact";
 type TimeField = "created_at" | "payment_completed_at";
+
 type PresetKey =
   | "none"
   | "today"
@@ -30,7 +33,9 @@ type TicketRow = {
   raffle_id: string;
   customer_id: string;
   ticket_number: number;
-  ticket_code: string | null;
+
+  // DB: tickets.ticket_code is NOT NULL
+  ticket_code: string;
 
   payment_status: PaymentStatus | string;
   payment_intent_id: string | null;
@@ -47,36 +52,81 @@ type TicketRow = {
 
   created_at: string | null;
 
-  // Explicit FK embedding + stable aliases
   raffle: { id: string; item_name: string } | null;
   customer: { id: string; email: string; name: string } | null;
 };
 
-type TicketRowRaw = Omit<TicketRow, "raffle" | "customer"> & {
-  raffle?: unknown;
-  customer?: unknown;
-};
-
 const PAGE_SIZE = 25;
 
-// ---------- Formatting / helpers ----------
-function formatMoney(amount: number | null, currency: string | null) {
-  if (amount == null) return "—";
-  const c = (currency || "eur").toUpperCase();
-  try {
-    return new Intl.NumberFormat("en-IE", {
-      style: "currency",
-      currency: c,
-      maximumFractionDigits: 2,
-    }).format(amount);
-  } catch {
-    return `${amount.toFixed(2)} ${c}`;
+/* ------------------------------ Safe helpers ----------------------------- */
+
+function isObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+
+function toStringOrNull(v: unknown): string | null {
+  if (v == null) return null;
+  return typeof v === "string" ? v : String(v);
+}
+
+function toStringOrEmpty(v: unknown): string {
+  if (v == null) return "";
+  return typeof v === "string" ? v : String(v);
+}
+
+function toNumberOrNull(v: unknown): number | null {
+  if (v == null) return null;
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
   }
+  return null;
+}
+
+function toIntOrNull(v: unknown): number | null {
+  const n = toNumberOrNull(v);
+  if (n == null) return null;
+  const i = Math.trunc(n);
+  return Number.isFinite(i) ? i : null;
+}
+
+function toBooleanOrNull(v: unknown): boolean | null {
+  if (v == null) return null;
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v !== 0;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (s === "true" || s === "t" || s === "1" || s === "yes") return true;
+    if (s === "false" || s === "f" || s === "0" || s === "no") return false;
+  }
+  return null;
+}
+
+function safeLower(x: string | null | undefined) {
+  return (x ?? "").toLowerCase().trim();
+}
+
+/**
+ * Supabase Postgres timestamps often look like:
+ * "2025-12-25 16:21:29.612469+00"
+ * which is NOT reliably parsed by all browsers as Date.
+ */
+function parseDateSafe(isoish: string): Date {
+  if (isoish.includes("T")) return new Date(isoish);
+  const normalized = isoish.replace(" ", "T");
+  const d = new Date(normalized);
+  if (Number.isNaN(d.getTime())) return new Date(isoish);
+  return d;
 }
 
 function shortId(id?: string | null) {
   if (!id) return "—";
   return id.length > 10 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
+}
+
+function escapeIlike(input: string) {
+  return input.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
 }
 
 function isStatusFilter(v: string): v is StatusFilter {
@@ -91,29 +141,18 @@ function isTimeField(v: string): v is TimeField {
   return v === "created_at" || v === "payment_completed_at";
 }
 
-function escapeIlike(input: string) {
-  return input.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
-}
-
-function isObj(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null;
-}
-
-function toRaffleSummary(v: unknown): TicketRow["raffle"] {
-  if (!isObj(v)) return null;
-  const id = typeof v.id === "string" ? v.id : null;
-  const item_name = typeof v.item_name === "string" ? v.item_name : null;
-  if (!id || !item_name) return null;
-  return { id, item_name };
-}
-
-function toCustomerSummary(v: unknown): TicketRow["customer"] {
-  if (!isObj(v)) return null;
-  const id = typeof v.id === "string" ? v.id : null;
-  const email = typeof v.email === "string" ? v.email : null;
-  const name = typeof v.name === "string" ? v.name : null;
-  if (!id || !email || !name) return null;
-  return { id, email, name };
+function formatMoney(amount: number | null, currency: string | null) {
+  if (amount == null) return "—";
+  const c = (currency || "eur").toUpperCase();
+  try {
+    return new Intl.NumberFormat("en-IE", {
+      style: "currency",
+      currency: c,
+      maximumFractionDigits: 2,
+    }).format(amount);
+  } catch {
+    return `${amount.toFixed(2)} ${c}`;
+  }
 }
 
 function isoAtStartOfDayLocal(d: Date) {
@@ -142,10 +181,92 @@ function buildLikePattern(mode: MatchMode, raw: string) {
   if (!s) return "";
   if (mode === "exact") return s; // handled via eq
   if (mode === "starts") return `${s}%`;
-  return `%${s}%`; // contains
+  return `%${s}%`;
 }
 
-// ---------- Customers/Raffles 2-step lookups ----------
+function toRaffleSummary(v: unknown): TicketRow["raffle"] {
+  if (!isObj(v)) return null;
+  const id = typeof v.id === "string" ? v.id : null;
+  const item_name = typeof v.item_name === "string" ? v.item_name : null;
+  if (!id || !item_name) return null;
+  return { id, item_name };
+}
+
+function toCustomerSummary(v: unknown): TicketRow["customer"] {
+  if (!isObj(v)) return null;
+  const id = typeof v.id === "string" ? v.id : null;
+  const email = typeof v.email === "string" ? v.email : null;
+  const name = typeof v.name === "string" ? v.name : null;
+  if (!id || !email || !name) return null;
+  return { id, email, name };
+}
+
+/**
+ * Normalize one ticket row (unknown-safe).
+ * We require: id, raffle_id, customer_id, ticket_number.
+ */
+function normalizeTicketRow(raw: unknown): TicketRow | null {
+  if (!isObj(raw)) return null;
+
+  const id = typeof raw.id === "string" ? raw.id : null;
+  const raffle_id = typeof raw.raffle_id === "string" ? raw.raffle_id : null;
+  const customer_id =
+    typeof raw.customer_id === "string" ? raw.customer_id : null;
+
+  const ticket_number = toIntOrNull(raw.ticket_number);
+
+  if (!id || !raffle_id || !customer_id || ticket_number == null) return null;
+
+  // DB is NOT NULL; treat missing/nullable as empty string to avoid null types.
+  const ticket_code = toStringOrEmpty(raw.ticket_code);
+
+  const payment_status =
+    toStringOrEmpty(raw.payment_status).trim() || "pending";
+  const payment_intent_id = toStringOrNull(raw.payment_intent_id);
+  const checkout_session_id = toStringOrNull(raw.checkout_session_id);
+
+  const payment_amount = toNumberOrNull(raw.payment_amount);
+  const payment_currency = toStringOrNull(raw.payment_currency);
+  const payment_method = toStringOrNull(raw.payment_method);
+
+  const payment_completed_at = toStringOrNull(raw.payment_completed_at);
+  const payment_error = toStringOrNull(raw.payment_error);
+
+  const is_winner = toBooleanOrNull(raw.is_winner);
+
+  const created_at = toStringOrNull(raw.created_at);
+
+  const raffle = toRaffleSummary(raw.raffle);
+  const customer = toCustomerSummary(raw.customer);
+
+  return {
+    id,
+    raffle_id,
+    customer_id,
+    ticket_number,
+    ticket_code,
+
+    payment_status,
+    payment_intent_id,
+    checkout_session_id,
+
+    payment_amount,
+    payment_currency,
+    payment_method,
+
+    payment_completed_at,
+    payment_error,
+
+    is_winner,
+    created_at,
+
+    raffle,
+    customer,
+  };
+}
+
+/* -------------------- Customers/Raffles 2-step lookups -------------------- */
+
 type CustomerLookupRow = { id: string };
 type RaffleLookupRow = { id: string };
 
@@ -156,6 +277,7 @@ async function lookupCustomerIdsByNameOrEmail(
   const q = search.trim();
   if (!q) return [];
   const s = escapeIlike(q);
+
   const { data, error } = await supabase
     .from("customers")
     .select("id")
@@ -163,7 +285,8 @@ async function lookupCustomerIdsByNameOrEmail(
     .limit(limit);
 
   if (error) throw error;
-  const rows = (data ?? []) as CustomerLookupRow[];
+
+  const rows = Array.isArray(data) ? (data as CustomerLookupRow[]) : [];
   return rows.map((r) => r.id).filter((id) => typeof id === "string");
 }
 
@@ -174,6 +297,7 @@ async function lookupRaffleIdsByItemName(
   const q = search.trim();
   if (!q) return [];
   const s = escapeIlike(q);
+
   const { data, error } = await supabase
     .from("raffles")
     .select("id")
@@ -181,9 +305,12 @@ async function lookupRaffleIdsByItemName(
     .limit(limit);
 
   if (error) throw error;
-  const rows = (data ?? []) as RaffleLookupRow[];
+
+  const rows = Array.isArray(data) ? (data as RaffleLookupRow[]) : [];
   return rows.map((r) => r.id).filter((id) => typeof id === "string");
 }
+
+/* --------------------------------- Page --------------------------------- */
 
 export default function AdminTicketsPage() {
   const router = useRouter();
@@ -192,22 +319,21 @@ export default function AdminTicketsPage() {
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
 
-  // -----------------------------
-  // Filters (basic)
-  // -----------------------------
+  // Basic
   const [status, setStatus] = useState<StatusFilter>("all");
   const [winnerOnly, setWinnerOnly] = useState(false);
 
   const [raffleId, setRaffleId] = useState(""); // exact
   const [customerId, setCustomerId] = useState(""); // exact
 
-  // -----------------------------
-  // Filters (human-friendly lookups)
-  // -----------------------------
-  const [customerSearch, setCustomerSearch] = useState(""); // name/email
-  const [raffleSearch, setRaffleSearch] = useState(""); // item_name
+  // Ticket id deep-link support (e.g. from Notifications “Find ticket”)
+  const [ticketId, setTicketId] = useState(""); // exact
 
-  // Debounce customer/raffle search inputs
+  // Human lookups
+  const [customerSearch, setCustomerSearch] = useState("");
+  const [raffleSearch, setRaffleSearch] = useState("");
+
+  // Debounce
   const custTimer = useRef<number | null>(null);
   const raffleTimer = useRef<number | null>(null);
 
@@ -236,9 +362,7 @@ export default function AdminTicketsPage() {
     };
   }, [raffleSearch]);
 
-  // -----------------------------
-  // Filters (IDs / refs)
-  // -----------------------------
+  // IDs/refs
   const [ticketCodeQuery, setTicketCodeQuery] = useState("");
   const [ticketCodeMode, setTicketCodeMode] = useState<MatchMode>("contains");
 
@@ -248,34 +372,31 @@ export default function AdminTicketsPage() {
     "all"
   );
 
-  // -----------------------------
-  // Filters (time)
-  // -----------------------------
-  const [timeField, setTimeField] = useState<TimeField>("created_at"); // created or completed
-  const [dateFrom, setDateFrom] = useState(""); // yyyy-mm-dd
-  const [dateTo, setDateTo] = useState(""); // yyyy-mm-dd
-  const [pendingOlderThanMinutes, setPendingOlderThanMinutes] = useState(""); // number input
+  // Time
+  const [timeField, setTimeField] = useState<TimeField>("created_at");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [pendingOlderThanMinutes, setPendingOlderThanMinutes] = useState("");
 
-  // -----------------------------
-  // Filters (amount/method/currency/errors)
-  // -----------------------------
+  // Amount/method/currency/errors
   const [minAmount, setMinAmount] = useState("");
   const [maxAmount, setMaxAmount] = useState("");
-  const [currency, setCurrency] = useState(""); // exact, optional
-  const [paymentMethod, setPaymentMethod] = useState(""); // ilike, optional
-  const [errorQuery, setErrorQuery] = useState(""); // ilike, optional
+  const [currency, setCurrency] = useState("");
+  const [paymentMethod, setPaymentMethod] = useState("");
+  const [errorQuery, setErrorQuery] = useState("");
 
   const [hasStripeRefsOnly, setHasStripeRefsOnly] = useState(false);
+
+  /**
+   * tickets.ticket_code is NOT NULL in your DB.
+   * This filter now means: "legacy bad rows where ticket_code is an empty string".
+   */
   const [missingTicketCodeOnly, setMissingTicketCodeOnly] = useState(false);
 
-  // -----------------------------
-  // Saved views / presets
-  // -----------------------------
+  // Presets
   const [preset, setPreset] = useState<PresetKey>("none");
 
-  // -----------------------------
   // Pagination
-  // -----------------------------
   const [page, setPage] = useState(1);
   const [rows, setRows] = useState<TicketRow[]>([]);
   const [totalCount, setTotalCount] = useState<number>(0);
@@ -285,59 +406,59 @@ export default function AdminTicketsPage() {
     return Math.max(1, pages);
   }, [totalCount]);
 
-  // -----------------------------
-  // URL -> State hydration (raffle_id, customer_id, status)
-  // -----------------------------
+  // URL -> State hydration
   const hydratedFromUrlRef = useRef(false);
   useEffect(() => {
     if (hydratedFromUrlRef.current) return;
 
-    const qpStatus = (searchParams.get("status") || "").trim().toLowerCase();
+    const qpStatus = safeLower(searchParams.get("status") || "");
     const qpRaffleId = (searchParams.get("raffle_id") || "").trim();
     const qpCustomerId = (searchParams.get("customer_id") || "").trim();
+    const qpTicketId = (searchParams.get("ticket_id") || "").trim();
 
     if (qpStatus && isStatusFilter(qpStatus)) setStatus(qpStatus);
     if (qpRaffleId) setRaffleId(qpRaffleId);
     if (qpCustomerId) setCustomerId(qpCustomerId);
+    if (qpTicketId) setTicketId(qpTicketId);
 
     hydratedFromUrlRef.current = true;
   }, [searchParams]);
 
-  // -----------------------------
-  // State -> URL sync (only these 3 params)
-  // -----------------------------
+  // State -> URL sync (keep your original rule: only sync these 3 params)
   const lastUrlKeyRef = useRef<string>("");
   useEffect(() => {
     if (!hydratedFromUrlRef.current) return;
 
     const sp = new URLSearchParams(searchParams.toString());
 
-    // status
     if (status && status !== "all") sp.set("status", status);
     else sp.delete("status");
 
-    // raffle_id
     const r = raffleId.trim();
     if (r) sp.set("raffle_id", r);
     else sp.delete("raffle_id");
 
-    // customer_id
     const c = customerId.trim();
     if (c) sp.set("customer_id", c);
     else sp.delete("customer_id");
 
-    const nextQs = sp.toString();
-    const key = `${status}|${r}|${c}|${nextQs}`;
+    // ticket_id is intentionally NOT synced; it’s a deep-link convenience.
+    // If it exists in URL, we keep it. If user clears it, we remove it.
+    const tid = ticketId.trim();
+    if (tid) sp.set("ticket_id", tid);
+    else sp.delete("ticket_id");
 
+    const nextQs = sp.toString();
+    const key = `${status}|${r}|${c}|${tid}|${nextQs}`;
     if (key === lastUrlKeyRef.current) return;
     lastUrlKeyRef.current = key;
 
     const url = nextQs ? `/tickets?${nextQs}` : "/tickets";
     router.replace(url, { scroll: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, raffleId, customerId, router]);
+  }, [status, raffleId, customerId, ticketId, router]);
 
-  // Reset to page 1 when filters change
+  // Reset pagination whenever filters change
   useEffect(() => {
     setPage(1);
   }, [
@@ -345,6 +466,7 @@ export default function AdminTicketsPage() {
     winnerOnly,
     raffleId,
     customerId,
+    ticketId,
     customerSearchDebounced,
     raffleSearchDebounced,
     ticketCodeQuery,
@@ -369,11 +491,11 @@ export default function AdminTicketsPage() {
   const applyPreset = useCallback((p: PresetKey) => {
     setPreset(p);
 
-    // Clear commonly conflicting filters first
     setStatus("all");
     setWinnerOnly(false);
     setRaffleId("");
     setCustomerId("");
+    setTicketId("");
     setCustomerSearch("");
     setRaffleSearch("");
     setTicketCodeQuery("");
@@ -465,7 +587,6 @@ export default function AdminTicketsPage() {
       const from = (page - 1) * PAGE_SIZE;
       const to = from + PAGE_SIZE - 1;
 
-      // 2-step lookups (only when the human-friendly filter is used)
       let customerIdsFromLookup: string[] | null = null;
       let raffleIdsFromLookup: string[] | null = null;
 
@@ -523,7 +644,10 @@ export default function AdminTicketsPage() {
         )
         .order("created_at", { ascending: false });
 
-      // ---- Basic filters
+      // Exact ticket id
+      const tid = ticketId.trim();
+      if (tid) query = query.eq("id", tid);
+
       if (status !== "all") query = query.eq("payment_status", status);
       if (winnerOnly) query = query.eq("is_winner", true);
 
@@ -533,7 +657,6 @@ export default function AdminTicketsPage() {
       const customerIdTrim = customerId.trim();
       if (customerIdTrim) query = query.eq("customer_id", customerIdTrim);
 
-      // ---- 2-step lookup filters
       if (customerIdsFromLookup && customerIdsFromLookup.length > 0) {
         query = query.in("customer_id", customerIdsFromLookup);
       }
@@ -541,12 +664,10 @@ export default function AdminTicketsPage() {
         query = query.in("raffle_id", raffleIdsFromLookup);
       }
 
-      // ---- Ticket code filter
       const tc = ticketCodeQuery.trim();
       if (tc) {
-        if (ticketCodeMode === "exact") {
-          query = query.eq("ticket_code", tc);
-        } else {
+        if (ticketCodeMode === "exact") query = query.eq("ticket_code", tc);
+        else {
           query = query.ilike(
             "ticket_code",
             buildLikePattern(ticketCodeMode, tc)
@@ -554,7 +675,6 @@ export default function AdminTicketsPage() {
         }
       }
 
-      // ---- Stripe ref filter (PI / CS)
       const sr = stripeRefQuery.trim();
       if (sr) {
         if (stripeRefMode === "exact") {
@@ -586,19 +706,17 @@ export default function AdminTicketsPage() {
         }
       }
 
-      // ---- Has Stripe refs only
       if (hasStripeRefsOnly) {
         query = query.or(
           "payment_intent_id.not.is.null,checkout_session_id.not.is.null"
         );
       }
 
-      // ---- Missing ticket_code only
+      // DB is NOT NULL, so "missing" means legacy empty string (if any).
       if (missingTicketCodeOnly) {
-        query = query.or("ticket_code.is.null,ticket_code.eq.");
+        query = query.eq("ticket_code", "");
       }
 
-      // ---- Time filters
       const tf: TimeField = timeField;
 
       if (dateFrom) {
@@ -610,35 +728,30 @@ export default function AdminTicketsPage() {
         query = query.lte(tf, d.toISOString());
       }
 
-      // ---- Pending older than N minutes
       const pendingMinutes = pendingOlderThanMinutes.trim()
         ? parseInt(pendingOlderThanMinutes.trim(), 10)
         : NaN;
       if (!Number.isNaN(pendingMinutes) && pendingMinutes > 0) {
+        // Forces status=pending. For pending, payment_completed_at is often null,
+        // so the practical default is to use created_at; but we honor the selected field.
         query = query.eq("payment_status", "pending");
         query = query.lte(tf, isoMinusMinutes(pendingMinutes));
       }
 
-      // ---- Amount filters
       const min = minAmount.trim() ? parseFloat(minAmount.trim()) : NaN;
       const max = maxAmount.trim() ? parseFloat(maxAmount.trim()) : NaN;
-
       if (!Number.isNaN(min)) query = query.gte("payment_amount", min);
       if (!Number.isNaN(max)) query = query.lte("payment_amount", max);
 
-      // ---- Currency filter (exact)
       const cur = currency.trim();
       if (cur) query = query.eq("payment_currency", cur.toLowerCase());
 
-      // ---- Payment method filter (ilike)
       const pm = paymentMethod.trim();
       if (pm) query = query.ilike("payment_method", `%${escapeIlike(pm)}%`);
 
-      // ---- Error filter (ilike)
       const eqry = errorQuery.trim();
       if (eqry) query = query.ilike("payment_error", `%${escapeIlike(eqry)}%`);
 
-      // Fetch
       const res = await query.range(from, to);
 
       const error: PostgrestError | null =
@@ -649,34 +762,13 @@ export default function AdminTicketsPage() {
 
       if (error) throw error;
 
-      const rawRows: TicketRowRaw[] = Array.isArray(dataUnknown)
-        ? (dataUnknown as unknown as TicketRowRaw[])
-        : [];
+      const list: unknown[] = Array.isArray(dataUnknown) ? dataUnknown : [];
+      const normalized: TicketRow[] = [];
 
-      const normalized: TicketRow[] = rawRows.map((r) => ({
-        id: r.id,
-        raffle_id: r.raffle_id,
-        customer_id: r.customer_id,
-        ticket_number: r.ticket_number,
-        ticket_code: r.ticket_code ?? null,
-
-        payment_status: r.payment_status,
-        payment_intent_id: r.payment_intent_id ?? null,
-        checkout_session_id: r.checkout_session_id ?? null,
-
-        payment_amount: r.payment_amount ?? null,
-        payment_currency: r.payment_currency ?? null,
-        payment_method: r.payment_method ?? null,
-
-        payment_completed_at: r.payment_completed_at ?? null,
-        payment_error: r.payment_error ?? null,
-
-        is_winner: r.is_winner ?? null,
-        created_at: r.created_at ?? null,
-
-        raffle: toRaffleSummary((r as TicketRowRaw).raffle),
-        customer: toCustomerSummary((r as TicketRowRaw).customer),
-      }));
+      for (const item of list) {
+        const t = normalizeTicketRow(item);
+        if (t) normalized.push(t);
+      }
 
       setRows(normalized);
       setTotalCount(count ?? 0);
@@ -696,6 +788,7 @@ export default function AdminTicketsPage() {
     winnerOnly,
     raffleId,
     customerId,
+    ticketId,
     customerSearchDebounced,
     raffleSearchDebounced,
     ticketCodeQuery,
@@ -720,7 +813,7 @@ export default function AdminTicketsPage() {
     fetchTickets();
   }, [fetchTickets]);
 
-  // Realtime refresh: throttle bursts to a single fetch
+  // Realtime refresh: throttle bursts
   const rtTimerRef = useRef<number | null>(null);
   useEffect(() => {
     let channel: RealtimeChannel | null = null;
@@ -745,32 +838,31 @@ export default function AdminTicketsPage() {
     };
   }, [fetchTickets]);
 
-  // Optional: derive a small set of “seen” currencies/methods for convenience
   const seenCurrencies = useMemo(() => {
     const set = new Set<string>();
-    for (const r of rows) {
+    for (const r of rows)
       if (r.payment_currency) set.add(r.payment_currency.toUpperCase());
-    }
     return Array.from(set).sort();
   }, [rows]);
 
   const seenMethods = useMemo(() => {
     const set = new Set<string>();
-    for (const r of rows) {
-      if (r.payment_method) set.add(r.payment_method);
-    }
+    for (const r of rows) if (r.payment_method) set.add(r.payment_method);
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [rows]);
 
-  // Preserve current list filters when navigating into /tickets/[id]
   const ticketListQs = useMemo(() => {
     const sp = new URLSearchParams();
     if (status !== "all") sp.set("status", status);
     if (raffleId.trim()) sp.set("raffle_id", raffleId.trim());
     if (customerId.trim()) sp.set("customer_id", customerId.trim());
+    if (ticketId.trim()) sp.set("ticket_id", ticketId.trim());
     const qs = sp.toString();
     return qs ? `?${qs}` : "";
-  }, [status, raffleId, customerId]);
+  }, [status, raffleId, customerId, ticketId]);
+
+  // Optional: collapse “advanced”
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   return (
     <div className="space-y-6">
@@ -784,9 +876,9 @@ export default function AdminTicketsPage() {
             Tickets
           </h1>
           <p className="text-sm" style={{ color: COLORS.textSecondary }}>
-            Admin view of all ticket purchases across raffles. Filter by status,
-            winners, customer/raffle (by ID or by name), date ranges, amounts,
-            Stripe references, and error reasons.
+            Admin view of ticket purchases across raffles. Supports filtering by
+            status, winners, customer/raffle (ID or lookup), date ranges,
+            amounts, Stripe refs, and error reasons.
           </p>
         </div>
 
@@ -870,7 +962,9 @@ export default function AdminTicketsPage() {
                 High value (min €10, last 7 days)
               </option>
               <option value="has_stripe_refs">Has Stripe refs</option>
-              <option value="missing_ticket_code">Missing ticket code</option>
+              <option value="missing_ticket_code">
+                Empty ticket_code (legacy)
+              </option>
             </select>
 
             <button
@@ -927,7 +1021,7 @@ export default function AdminTicketsPage() {
           boxShadow: `0 18px 40px ${COLORS.cardShadow}`,
         }}
       >
-        {/* Row 1: status/winner + time */}
+        {/* Basic */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="space-y-2">
             <label
@@ -988,10 +1082,26 @@ export default function AdminTicketsPage() {
                 checked={missingTicketCodeOnly}
                 onChange={(e) => setMissingTicketCodeOnly(e.target.checked)}
               />
-              Missing ticket_code
+              Empty ticket_code (legacy)
             </label>
+
+            <button
+              type="button"
+              className="mt-3 w-full px-3 py-2 rounded-xl text-sm font-medium border"
+              style={{
+                borderColor: COLORS.cardBorder,
+                backgroundColor: advancedOpen
+                  ? COLORS.tabActiveBg
+                  : COLORS.tabBg,
+                color: COLORS.textPrimary,
+              }}
+              onClick={() => setAdvancedOpen((v) => !v)}
+            >
+              {advancedOpen ? "Hide advanced filters" : "Show advanced filters"}
+            </button>
           </div>
 
+          {/* Time */}
           <div className="space-y-2 md:col-span-3">
             <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
               <div className="space-y-2">
@@ -1159,93 +1269,117 @@ export default function AdminTicketsPage() {
           </div>
         </div>
 
-        {/* Row 2: Customer/Raffle by ID + by name */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <div className="space-y-2">
-            <label
-              className="text-sm font-medium"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Customer ID (exact)
-            </label>
-            <input
-              value={customerId}
-              onChange={(e) => setCustomerId(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-              placeholder="uuid"
-            />
+        {/* Advanced */}
+        {advancedOpen && (
+          <div className="space-y-5">
+            {/* Ticket id + Customer/Raffle */}
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <div className="space-y-2">
+                <label
+                  className="text-sm font-medium"
+                  style={{ color: COLORS.textSecondary }}
+                >
+                  Ticket ID (exact)
+                </label>
+                <input
+                  value={ticketId}
+                  onChange={(e) => setTicketId(e.target.value)}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                  style={{
+                    borderColor: COLORS.inputBorder,
+                    backgroundColor: COLORS.inputBg,
+                    color: COLORS.textPrimary,
+                  }}
+                  placeholder="uuid"
+                />
+                <div className="text-xs" style={{ color: COLORS.textMuted }}>
+                  Supports deep-links: <code>ticket_id</code>.
+                </div>
+              </div>
 
-            <label
-              className="text-sm font-medium mt-3 block"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Customer (name or email)
-            </label>
-            <input
-              value={customerSearch}
-              onChange={(e) => setCustomerSearch(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-              placeholder="e.g. Mohammad or gmail.com"
-            />
-            <div className="text-xs" style={{ color: COLORS.textMuted }}>
-              Uses a 2-step lookup against customers table.
-            </div>
-          </div>
+              <div className="space-y-2">
+                <label
+                  className="text-sm font-medium"
+                  style={{ color: COLORS.textSecondary }}
+                >
+                  Customer ID (exact)
+                </label>
+                <input
+                  value={customerId}
+                  onChange={(e) => setCustomerId(e.target.value)}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                  style={{
+                    borderColor: COLORS.inputBorder,
+                    backgroundColor: COLORS.inputBg,
+                    color: COLORS.textPrimary,
+                  }}
+                  placeholder="uuid"
+                />
 
-          <div className="space-y-2">
-            <label
-              className="text-sm font-medium"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Raffle ID (exact)
-            </label>
-            <input
-              value={raffleId}
-              onChange={(e) => setRaffleId(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-              placeholder="uuid"
-            />
+                <label
+                  className="text-sm font-medium mt-3 block"
+                  style={{ color: COLORS.textSecondary }}
+                >
+                  Customer (name or email)
+                </label>
+                <input
+                  value={customerSearch}
+                  onChange={(e) => setCustomerSearch(e.target.value)}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                  style={{
+                    borderColor: COLORS.inputBorder,
+                    backgroundColor: COLORS.inputBg,
+                    color: COLORS.textPrimary,
+                  }}
+                  placeholder="e.g. Mohammad or gmail.com"
+                />
+                <div className="text-xs" style={{ color: COLORS.textMuted }}>
+                  2-step lookup against customers table.
+                </div>
+              </div>
 
-            <label
-              className="text-sm font-medium mt-3 block"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Raffle (item name)
-            </label>
-            <input
-              value={raffleSearch}
-              onChange={(e) => setRaffleSearch(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-              placeholder="e.g. iPhone, AirPods..."
-            />
-            <div className="text-xs" style={{ color: COLORS.textMuted }}>
-              Uses a 2-step lookup against raffles table.
-            </div>
-          </div>
+              <div className="space-y-2">
+                <label
+                  className="text-sm font-medium"
+                  style={{ color: COLORS.textSecondary }}
+                >
+                  Raffle ID (exact)
+                </label>
+                <input
+                  value={raffleId}
+                  onChange={(e) => setRaffleId(e.target.value)}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                  style={{
+                    borderColor: COLORS.inputBorder,
+                    backgroundColor: COLORS.inputBg,
+                    color: COLORS.textPrimary,
+                  }}
+                  placeholder="uuid"
+                />
 
-          {/* Row 2 continued: ticket code and Stripe refs */}
-          <div className="space-y-2 md:col-span-2">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <label
+                  className="text-sm font-medium mt-3 block"
+                  style={{ color: COLORS.textSecondary }}
+                >
+                  Raffle (item name)
+                </label>
+                <input
+                  value={raffleSearch}
+                  onChange={(e) => setRaffleSearch(e.target.value)}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                  style={{
+                    borderColor: COLORS.inputBorder,
+                    backgroundColor: COLORS.inputBg,
+                    color: COLORS.textPrimary,
+                  }}
+                  placeholder="e.g. iPhone, AirPods..."
+                />
+                <div className="text-xs" style={{ color: COLORS.textMuted }}>
+                  2-step lookup against raffles table.
+                </div>
+              </div>
+
+              {/* Ticket code + Stripe refs */}
               <div className="space-y-2">
                 <label
                   className="text-sm font-medium"
@@ -1284,11 +1418,9 @@ export default function AdminTicketsPage() {
                     placeholder="e.g. SW-000123-AB12CD"
                   />
                 </div>
-              </div>
 
-              <div className="space-y-2">
                 <label
-                  className="text-sm font-medium"
+                  className="text-sm font-medium mt-3 block"
                   style={{ color: COLORS.textSecondary }}
                 >
                   Stripe reference
@@ -1332,7 +1464,7 @@ export default function AdminTicketsPage() {
                   <input
                     value={stripeRefQuery}
                     onChange={(e) => setStripeRefQuery(e.target.value)}
-                    className="w-full border rounded px-3 py-2 text-sm md:col-span-1"
+                    className="w-full border rounded px-3 py-2 text-sm"
                     style={{
                       borderColor: COLORS.inputBorder,
                       backgroundColor: COLORS.inputBg,
@@ -1341,143 +1473,145 @@ export default function AdminTicketsPage() {
                     placeholder="pi_... or cs_..."
                   />
                 </div>
+
+                <div className="text-xs" style={{ color: COLORS.textMuted }}>
+                  Ticket code + Stripe refs are ticket-side filters (no extra
+                  lookup needed).
+                </div>
               </div>
             </div>
 
-            <div className="text-xs" style={{ color: COLORS.textMuted }}>
-              Ticket code + Stripe refs are ticket-side filters (no extra lookup
-              needed).
+            {/* Amount/currency/method/error */}
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <div className="space-y-2">
+                <label
+                  className="text-sm font-medium"
+                  style={{ color: COLORS.textSecondary }}
+                >
+                  Min amount
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  value={minAmount}
+                  onChange={(e) => setMinAmount(e.target.value)}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                  style={{
+                    borderColor: COLORS.inputBorder,
+                    backgroundColor: COLORS.inputBg,
+                    color: COLORS.textPrimary,
+                  }}
+                  placeholder="e.g. 5"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label
+                  className="text-sm font-medium"
+                  style={{ color: COLORS.textSecondary }}
+                >
+                  Max amount
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  value={maxAmount}
+                  onChange={(e) => setMaxAmount(e.target.value)}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                  style={{
+                    borderColor: COLORS.inputBorder,
+                    backgroundColor: COLORS.inputBg,
+                    color: COLORS.textPrimary,
+                  }}
+                  placeholder="e.g. 50"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label
+                  className="text-sm font-medium"
+                  style={{ color: COLORS.textSecondary }}
+                >
+                  Currency (exact)
+                </label>
+                <input
+                  value={currency}
+                  onChange={(e) => setCurrency(e.target.value)}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                  style={{
+                    borderColor: COLORS.inputBorder,
+                    backgroundColor: COLORS.inputBg,
+                    color: COLORS.textPrimary,
+                  }}
+                  placeholder={
+                    seenCurrencies.length
+                      ? `e.g. ${seenCurrencies[0]}`
+                      : "e.g. EUR"
+                  }
+                />
+                {seenCurrencies.length > 0 ? (
+                  <div className="text-xs" style={{ color: COLORS.textMuted }}>
+                    Seen: {seenCurrencies.join(", ")}
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="space-y-2">
+                <label
+                  className="text-sm font-medium"
+                  style={{ color: COLORS.textSecondary }}
+                >
+                  Payment method (contains)
+                </label>
+                <input
+                  value={paymentMethod}
+                  onChange={(e) => setPaymentMethod(e.target.value)}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                  style={{
+                    borderColor: COLORS.inputBorder,
+                    backgroundColor: COLORS.inputBg,
+                    color: COLORS.textPrimary,
+                  }}
+                  placeholder={
+                    seenMethods.length ? `e.g. ${seenMethods[0]}` : "e.g. card"
+                  }
+                />
+                {seenMethods.length > 0 ? (
+                  <div className="text-xs" style={{ color: COLORS.textMuted }}>
+                    Seen: {seenMethods.slice(0, 6).join(", ")}
+                    {seenMethods.length > 6 ? "…" : ""}
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="space-y-2 md:col-span-4">
+                <label
+                  className="text-sm font-medium"
+                  style={{ color: COLORS.textSecondary }}
+                >
+                  Error reason (contains)
+                </label>
+                <input
+                  value={errorQuery}
+                  onChange={(e) => setErrorQuery(e.target.value)}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                  style={{
+                    borderColor: COLORS.inputBorder,
+                    backgroundColor: COLORS.inputBg,
+                    color: COLORS.textPrimary,
+                  }}
+                  placeholder="e.g. insufficient, authentication, expired, webhook..."
+                />
+                <div className="text-xs" style={{ color: COLORS.textMuted }}>
+                  Matches payment_error via ILIKE. Useful for triage across
+                  failed/pending workflows.
+                </div>
+              </div>
             </div>
           </div>
-        </div>
-
-        {/* Row 3: amount/currency/method/error */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <div className="space-y-2">
-            <label
-              className="text-sm font-medium"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Min amount
-            </label>
-            <input
-              type="number"
-              step="0.01"
-              min="0"
-              value={minAmount}
-              onChange={(e) => setMinAmount(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-              placeholder="e.g. 5"
-            />
-          </div>
-
-          <div className="space-y-2">
-            <label
-              className="text-sm font-medium"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Max amount
-            </label>
-            <input
-              type="number"
-              step="0.01"
-              min="0"
-              value={maxAmount}
-              onChange={(e) => setMaxAmount(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-              placeholder="e.g. 50"
-            />
-          </div>
-
-          <div className="space-y-2">
-            <label
-              className="text-sm font-medium"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Currency (exact)
-            </label>
-            <input
-              value={currency}
-              onChange={(e) => setCurrency(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-              placeholder={
-                seenCurrencies.length ? `e.g. ${seenCurrencies[0]}` : "e.g. EUR"
-              }
-            />
-            {seenCurrencies.length > 0 ? (
-              <div className="text-xs" style={{ color: COLORS.textMuted }}>
-                Seen: {seenCurrencies.join(", ")}
-              </div>
-            ) : null}
-          </div>
-
-          <div className="space-y-2">
-            <label
-              className="text-sm font-medium"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Payment method (contains)
-            </label>
-            <input
-              value={paymentMethod}
-              onChange={(e) => setPaymentMethod(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-              placeholder={
-                seenMethods.length ? `e.g. ${seenMethods[0]}` : "e.g. card"
-              }
-            />
-            {seenMethods.length > 0 ? (
-              <div className="text-xs" style={{ color: COLORS.textMuted }}>
-                Seen: {seenMethods.slice(0, 6).join(", ")}
-                {seenMethods.length > 6 ? "…" : ""}
-              </div>
-            ) : null}
-          </div>
-
-          <div className="space-y-2 md:col-span-4">
-            <label
-              className="text-sm font-medium"
-              style={{ color: COLORS.textSecondary }}
-            >
-              Error reason (contains)
-            </label>
-            <input
-              value={errorQuery}
-              onChange={(e) => setErrorQuery(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-              style={{
-                borderColor: COLORS.inputBorder,
-                backgroundColor: COLORS.inputBg,
-                color: COLORS.textPrimary,
-              }}
-              placeholder="e.g. insufficient, authentication, expired, webhook..."
-            />
-            <div className="text-xs" style={{ color: COLORS.textMuted }}>
-              Matches payment_error via ILIKE. Useful for triage across
-              failed/pending workflows.
-            </div>
-          </div>
-        </div>
+        )}
 
         {fetchError && (
           <div
@@ -1578,7 +1712,13 @@ export default function AdminTicketsPage() {
                   const custEmail = t.customer?.email ?? "—";
 
                   const created = t.created_at
-                    ? new Date(t.created_at).toLocaleString("en-IE")
+                    ? parseDateSafe(t.created_at).toLocaleString("en-IE")
+                    : "—";
+
+                  const completed = t.payment_completed_at
+                    ? parseDateSafe(t.payment_completed_at).toLocaleString(
+                        "en-IE"
+                      )
                     : "—";
 
                   const statusLabel =
@@ -1634,7 +1774,7 @@ export default function AdminTicketsPage() {
                             className="text-xs"
                             style={{ color: COLORS.textMuted }}
                           >
-                            Code: {t.ticket_code ?? "—"}
+                            Code: {t.ticket_code || "—"}
                           </div>
 
                           <div
@@ -1744,12 +1884,7 @@ export default function AdminTicketsPage() {
                           className="text-xs"
                           style={{ color: COLORS.textMuted }}
                         >
-                          Completed:{" "}
-                          {t.payment_completed_at
-                            ? new Date(t.payment_completed_at).toLocaleString(
-                                "en-IE"
-                              )
-                            : "—"}
+                          Completed: {completed}
                         </div>
                       </td>
 
@@ -1854,7 +1989,7 @@ export default function AdminTicketsPage() {
           <li>Realtime refresh on any ticket insert/update/delete.</li>
           <li>
             URL params supported: <code>status</code>, <code>raffle_id</code>,{" "}
-            <code>customer_id</code>.
+            <code>customer_id</code>, <code>ticket_id</code>.
           </li>
         </ul>
       </div>

@@ -2,7 +2,14 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import type { PostgrestError, RealtimeChannel } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabaseClient";
@@ -39,6 +46,7 @@ type TicketDetail = {
     ticket_price: number;
     status: string;
   } | null;
+
   customers?: { id: string; email: string; name?: string | null } | null;
 };
 
@@ -92,7 +100,7 @@ function formatMoney(amount: number | null, currency: string | null) {
   }
 }
 
-function kv(label: string, value: React.ReactNode) {
+function kv(label: string, value: ReactNode) {
   return (
     <div className="space-y-1">
       <div className="text-xs" style={{ color: COLORS.textMuted }}>
@@ -116,7 +124,6 @@ export default function AdminTicketDetailPage() {
   const rawId = (params as { id?: string | string[] }).id;
   const ticketId = Array.isArray(rawId) ? rawId[0] : rawId;
 
-  // Preserve list filters when going “Back to tickets”
   const backToTicketsHref = useMemo(() => {
     const sp = new URLSearchParams(searchParams.toString());
     const qs = sp.toString();
@@ -309,7 +316,6 @@ export default function AdminTicketDetailPage() {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
         <div>
           <Link
@@ -360,7 +366,6 @@ export default function AdminTicketDetailPage() {
         </div>
       </div>
 
-      {/* Main card */}
       <div
         className="rounded-2xl p-5 border space-y-6"
         style={{
