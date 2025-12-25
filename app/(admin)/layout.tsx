@@ -3,7 +3,7 @@
 
 import { ReactNode, useEffect, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
 
@@ -23,6 +23,42 @@ function clearAdminCookie() {
   document.cookie =
     `snapwin-admin=; Path=/; Max-Age=0; SameSite=Lax` +
     (isHttps() ? "; Secure" : "");
+}
+
+function NavItem({ href, label }: { href: string; label: string }) {
+  const pathname = usePathname();
+  const active =
+    pathname === href || (href !== "/" && pathname?.startsWith(href + "/"));
+
+  return (
+    <Link
+      href={href}
+      className="rounded px-3 py-2 transition"
+      style={{
+        color: active ? COLORS.primary : COLORS.textPrimary,
+        backgroundColor: active ? COLORS.highlightCardBg : "transparent",
+        border: active
+          ? `1px solid ${COLORS.cardBorder}`
+          : "1px solid transparent",
+      }}
+    >
+      {label}
+    </Link>
+  );
+}
+
+function NavGroup({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="space-y-2">
+      <div
+        className="text-[0.7rem] uppercase tracking-wide font-semibold px-1"
+        style={{ color: COLORS.textMuted }}
+      >
+        {title}
+      </div>
+      <div className="flex flex-col gap-1">{children}</div>
+    </div>
+  );
 }
 
 export default function AdminLayout({ children }: { children: ReactNode }) {
@@ -66,7 +102,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
 
-        // Your production error: "Invalid Refresh Token: Refresh Token Not Found"
+        // Production error: "Invalid Refresh Token: Refresh Token Not Found"
         if (msg.toLowerCase().includes("refresh token")) {
           await failToLogin();
           return;
@@ -106,85 +142,54 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
   return (
     <div className="flex h-screen" style={{ backgroundColor: COLORS.screenBg }}>
       <aside
-        className="w-64 border-r p-4 flex flex-col"
+        className="w-72 border-r p-4 flex flex-col gap-6"
         style={{
           backgroundColor: COLORS.cardBg,
           borderColor: COLORS.cardBorder,
         }}
       >
-        <h2
-          className="text-2xl font-bold mb-6"
-          style={{ color: COLORS.primary }}
-        >
-          SnapWin Admin
-        </h2>
+        <div>
+          <h2 className="text-2xl font-bold" style={{ color: COLORS.primary }}>
+            SnapWin Admin
+          </h2>
+          <div className="text-xs mt-1" style={{ color: COLORS.textMuted }}>
+            Admin dashboard
+          </div>
+        </div>
 
-        <nav className="flex flex-col space-y-3 flex-1">
-          <Link
-            href="/dashboard"
-            className="hover:underline"
-            style={{ color: COLORS.textPrimary }}
-          >
-            Dashboard
-          </Link>
+        <nav className="flex flex-col gap-5 flex-1">
+          <NavGroup title="Core">
+            <NavItem href="/dashboard" label="Dashboard" />
+            <NavItem href="/raffles" label="Raffles" />
+            <NavItem href="/tickets" label="Tickets" />
+            <NavItem href="/customers" label="Customers" />
+            <NavItem href="/payments" label="Payments" />
+            <NavItem href="/support" label="Support" />
+          </NavGroup>
 
-          <Link
-            href="/raffles"
-            className="hover:underline"
-            style={{ color: COLORS.textPrimary }}
-          >
-            Raffles
-          </Link>
+          <NavGroup title="Notifications">
+            {/* Existing list */}
+            <NavItem href="/notifications" label="Notifications (Inbox)" />
 
-          <Link
-            href="/customers"
-            className="hover:underline"
-            style={{ color: COLORS.textPrimary }}
-          >
-            Customers
-          </Link>
+            {/* ✅ NEW: Notification campaigns */}
+            <NavItem href="/notifications/campaigns" label="Campaigns" />
 
-          {/* ✅ NEW: Tickets */}
-          <Link
-            href="/tickets"
-            className="hover:underline"
-            style={{ color: COLORS.textPrimary }}
-          >
-            Tickets
-          </Link>
+            {/* ✅ NEW: Send notifications */}
+            <NavItem href="/notifications/send" label="Send" />
 
-          <Link
-            href="/payments"
-            className="hover:underline"
-            style={{ color: COLORS.textPrimary }}
-          >
-            Payments
-          </Link>
-
-          <Link
-            href="/support"
-            className="hover:underline"
-            style={{ color: COLORS.textPrimary }}
-          >
-            Support
-          </Link>
-
-          <Link
-            href="/notifications"
-            className="hover:underline"
-            style={{ color: COLORS.textPrimary }}
-          >
-            Notifications
-          </Link>
+            {/* ✅ NEW: Reports */}
+            <NavItem href="/notifications/reports" label="Reports" />
+          </NavGroup>
         </nav>
 
         <button
           onClick={handleLogout}
-          className="mt-4 w-full rounded py-2 text-sm"
+          className="mt-2 w-full rounded py-2 text-sm"
           style={{
             borderWidth: 1,
             borderColor: COLORS.error,
             color: COLORS.error,
+            backgroundColor: "transparent",
           }}
         >
           Logout
