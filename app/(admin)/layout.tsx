@@ -165,7 +165,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
             <NavItem href="/customers" label="Customers" />
             <NavItem href="/payments" label="Payments" />
             <NavItem href="/support" label="Support" />
-            <NavItem href="/notifications/reports" label="Reports" />
+            <NavItem href="/reports" label="Reports" />
           </NavGroup>
 
           <NavGroup title="Notifications">
