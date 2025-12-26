@@ -31,6 +31,12 @@ type DeliveryRow = {
   error: string | null;
 };
 
+type CustomerMini = {
+  id: string;
+  name: string;
+  email: string;
+};
+
 type ModeKey =
   | "all_users"
   | "raffle_users"
@@ -41,7 +47,7 @@ type ModeKey =
 
 type StatusFilter = "all" | "pending" | "ok" | "failed";
 
-// type RaffleMini = { id: string; item_name: string };
+type CustomerMap = Record<string, CustomerMini>;
 
 function safeString(v: unknown): string {
   if (typeof v === "string") return v;
@@ -140,6 +146,41 @@ function jsonPreview(
   return s.length > max ? `${s.slice(0, max)}…` : s;
 }
 
+function inferPushAttempted(d: DeliveryRow): boolean {
+  // DB-truth: push_attempted, but if your edge function didn't write back,
+  // we still consider it attempted when there is response or error.
+  if (d.push_attempted) return true;
+  if (d.error) return true;
+  if (d.push_response && Object.keys(d.push_response).length > 0) return true;
+  return false;
+}
+
+function inferPushOk(d: DeliveryRow): boolean | null {
+  // If DB says attempted, trust DB's push_ok.
+  if (d.push_attempted) return d.push_ok;
+
+  // If DB did not mark attempted but we have an error -> failed.
+  if (d.error) return false;
+
+  // If we have response, attempt to infer "ok" from common shapes.
+  // We do NOT assume the exact response schema—only do light checks.
+  if (d.push_response) {
+    const pr = d.push_response;
+    const status = safeString(pr["status"]).toLowerCase();
+    if (status === "ok" || status === "success") return true;
+    if (status === "error" || status === "failed") return false;
+
+    const ok = pr["ok"];
+    if (typeof ok === "boolean") return ok;
+
+    // Unknown: attempted but cannot infer outcome.
+    return null;
+  }
+
+  // Truly pending.
+  return null;
+}
+
 export default function CampaignDetailPage() {
   const router = useRouter();
   const params = useParams();
@@ -156,6 +197,9 @@ export default function CampaignDetailPage() {
   const [raffleNameById, setRaffleNameById] = useState<Record<string, string>>(
     {}
   );
+
+  // customer resolver (for deliveries)
+  const [customerById, setCustomerById] = useState<CustomerMap>({});
 
   // deliveries
   const PAGE_SIZE = 50;
@@ -313,6 +357,39 @@ export default function CampaignDetailPage() {
     [raffleNameById]
   );
 
+  const resolveCustomers = useCallback(
+    async (ids: string[]) => {
+      const uniq = Array.from(new Set(ids.filter(Boolean)));
+      const unknown = uniq.filter((id) => !customerById[id]);
+      if (unknown.length === 0) return;
+
+      const { data, error } = await supabase
+        .from("customers")
+        .select("id,name,email")
+        .in("id", unknown)
+        .limit(500);
+
+      if (error) throw error;
+
+      const list = Array.isArray(data) ? (data as unknown[]) : [];
+      const next: CustomerMap = { ...customerById };
+
+      for (const r of list) {
+        const obj = (r ?? {}) as Record<string, unknown>;
+        const id = safeString(obj["id"]);
+        if (!id) continue;
+        next[id] = {
+          id,
+          name: safeString(obj["name"]),
+          email: safeString(obj["email"]),
+        };
+      }
+
+      setCustomerById(next);
+    },
+    [customerById]
+  );
+
   const loadDeliveries = useCallback(
     async (opts: { reset: boolean }) => {
       if (!campaignId) return;
@@ -334,7 +411,7 @@ export default function CampaignDetailPage() {
           .order("created_at", { ascending: false })
           .range(from, to);
 
-        // status filter
+        // status filter (DB-truth filter)
         if (status === "pending") {
           q = q.eq("push_attempted", false);
         } else if (status === "ok") {
@@ -379,6 +456,9 @@ export default function CampaignDetailPage() {
         }
 
         setHasMore(normalized.length === PAGE_SIZE);
+
+        // Resolve customer labels for the currently loaded page
+        await resolveCustomers(normalized.map((d) => d.customer_id));
       } catch (e: unknown) {
         setDeliveriesError(
           e instanceof Error ? e.message : "Failed to load deliveries."
@@ -387,7 +467,7 @@ export default function CampaignDetailPage() {
         setDeliveriesLoading(false);
       }
     },
-    [PAGE_SIZE, campaignId, page, status]
+    [PAGE_SIZE, campaignId, page, resolveCustomers, status]
   );
 
   // initial load
@@ -418,6 +498,8 @@ export default function CampaignDetailPage() {
       "created_at",
       "campaign_id",
       "customer_id",
+      "customer_name",
+      "customer_email",
       "expo_push_token",
       "in_app_inserted",
       "push_attempted",
@@ -431,11 +513,14 @@ export default function CampaignDetailPage() {
     lines.push(header.join(","));
 
     for (const d of deliveries) {
+      const cm = customerById[d.customer_id];
       const row = [
         d.id,
         d.created_at,
         d.campaign_id,
         d.customer_id,
+        cm?.name ?? "",
+        cm?.email ?? "",
         d.expo_push_token ?? "",
         String(d.in_app_inserted),
         String(d.push_attempted),
@@ -453,7 +538,7 @@ export default function CampaignDetailPage() {
       lines.join("\n")
     );
     showToast("CSV exported (current page)");
-  }, [campaign, deliveries, showToast]);
+  }, [campaign, deliveries, customerById, showToast]);
 
   const criteriaSummary = useMemo(() => {
     if (!campaign) return "—";
@@ -466,6 +551,14 @@ export default function CampaignDetailPage() {
     if (status === "failed") return "Failed";
     return "All";
   }, [status]);
+
+  const telemetryLooksUnwritten = useMemo(() => {
+    // If you have deliveries but all show push_attempted=false, it usually means
+    // the sender did not update DB after sending.
+    if (deliveries.length === 0) return false;
+    const attempted = deliveries.some((d) => d.push_attempted);
+    return !attempted;
+  }, [deliveries]);
 
   if (loading) {
     return (
@@ -674,9 +767,9 @@ export default function CampaignDetailPage() {
               }}
             >
               <option value="all">All</option>
-              <option value="pending">Pending</option>
-              <option value="ok">OK</option>
-              <option value="failed">Failed</option>
+              <option value="pending">Pending (DB)</option>
+              <option value="ok">OK (DB)</option>
+              <option value="failed">Failed (DB)</option>
             </select>
 
             <button
@@ -695,6 +788,22 @@ export default function CampaignDetailPage() {
             </button>
           </div>
         </div>
+
+        {telemetryLooksUnwritten ? (
+          <div
+            className="px-4 py-3 text-xs border-b"
+            style={{
+              backgroundColor: "#FFFBEB",
+              borderColor: "#FDE68A",
+              color: "#92400E",
+            }}
+          >
+            Note: DB telemetry shows <b>push_attempted=false</b> for these rows.
+            Push delivery is still displayed using an inferred status when there
+            is a response/error, but the canonical fix is to update delivery
+            rows from the Edge Function after sending.
+          </div>
+        ) : null}
 
         {deliveriesError ? (
           <div
@@ -725,7 +834,7 @@ export default function CampaignDetailPage() {
           </div>
         ) : (
           <div className="overflow-auto">
-            <table className="min-w-[980px] w-full text-sm">
+            <table className="min-w-[1120px] w-full text-sm">
               <thead>
                 <tr style={{ backgroundColor: COLORS.screenBg }}>
                   <th
@@ -766,13 +875,20 @@ export default function CampaignDetailPage() {
                   </th>
                 </tr>
               </thead>
+
               <tbody>
                 {deliveries.map((d) => {
-                  const pushState = !d.push_attempted
+                  const cm = customerById[d.customer_id];
+                  const attempted = inferPushAttempted(d);
+                  const ok = inferPushOk(d);
+
+                  const pushState = !attempted
                     ? "PENDING"
-                    : d.push_ok
+                    : ok === true
                     ? "OK"
-                    : "FAILED";
+                    : ok === false
+                    ? "FAILED"
+                    : "ATTEMPTED";
 
                   return (
                     <tr
@@ -786,12 +902,24 @@ export default function CampaignDetailPage() {
                       >
                         {formatDate(d.created_at)}
                       </td>
+
                       <td
                         className="px-4 py-2"
                         style={{ color: COLORS.textPrimary }}
                       >
-                        {formatShortId(d.customer_id)}
+                        <div className="font-medium">
+                          {cm?.name ? cm.name : formatShortId(d.customer_id)}
+                        </div>
+                        <div
+                          className="text-xs"
+                          style={{ color: COLORS.textMuted }}
+                        >
+                          {cm?.email
+                            ? cm.email
+                            : `ID: ${formatShortId(d.customer_id)}`}
+                        </div>
                       </td>
+
                       <td
                         className="px-4 py-2"
                         style={{ color: COLORS.textPrimary }}
@@ -802,20 +930,24 @@ export default function CampaignDetailPage() {
                           style={{ color: COLORS.textMuted }}
                         >
                           {d.push_provider ?? "expo"}
+                          {!d.push_attempted && attempted ? " (inferred)" : ""}
                         </div>
                       </td>
+
                       <td
                         className="px-4 py-2"
                         style={{ color: COLORS.textPrimary }}
                       >
                         {d.in_app_inserted ? "Yes" : "No"}
                       </td>
+
                       <td
                         className="px-4 py-2"
                         style={{ color: COLORS.textSecondary }}
                       >
                         {d.expo_push_token ? "Yes" : "No"}
                       </td>
+
                       <td
                         className="px-4 py-2"
                         style={{ color: COLORS.textSecondary }}
@@ -824,7 +956,7 @@ export default function CampaignDetailPage() {
                           <div style={{ color: COLORS.error }}>{d.error}</div>
                         ) : d.push_response ? (
                           <div className="text-xs">
-                            {jsonPreview(d.push_response, 220)}
+                            {jsonPreview(d.push_response, 240)}
                           </div>
                         ) : (
                           "—"
