@@ -4,6 +4,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
+import { adminSendNotificationCampaign } from "@/lib/adminNotifications";
+
+await adminSendNotificationCampaign({
+  mode: "all_users",
+  title: "Test",
+  body: "Hello",
+  data: { source: "admin-dashboard" },
+});
 
 type Mode =
   | "all_users"
