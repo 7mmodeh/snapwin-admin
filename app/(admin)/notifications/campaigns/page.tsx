@@ -46,6 +46,9 @@ type ModeKey =
   | "multi_raffle_union"
   | "unknown";
 
+// type RafflePick = { id: string; item_name: string };
+type CustomerMini = { id: string; name: string; email: string };
+
 function toModeKey(v: string): ModeKey {
   const x = (v ?? "").trim();
   if (
@@ -110,66 +113,6 @@ function timeAgo(iso: string) {
   if (h < 24) return `${h}h ago`;
   const days = Math.floor(h / 24);
   return `${days}d ago`;
-}
-
-function summarizeCriteria(
-  mode: string,
-  criteria: Record<string, unknown>
-): string {
-  const mk = toModeKey(mode);
-
-  const raffleId = safeString(criteria["raffle_id"]);
-  const raffleIds = criteria["raffle_ids"];
-  const customerIds = criteria["customer_ids"];
-  const attemptPassed = criteria["attempt_passed"];
-  const onlyCompleted = criteria["only_completed_tickets"];
-
-  const onlyCompletedText =
-    typeof onlyCompleted === "boolean"
-      ? onlyCompleted
-        ? "Completed tickets only"
-        : "All tickets"
-      : "Completed tickets only";
-
-  if (mk === "all_users") return "Everyone";
-
-  if (mk === "raffle_users") {
-    return raffleId
-      ? `Raffle: ${formatShortId(raffleId)} • ${onlyCompletedText}`
-      : `Raffle: — • ${onlyCompletedText}`;
-  }
-
-  if (mk === "multi_raffle_union") {
-    const count = Array.isArray(raffleIds)
-      ? raffleIds.length
-      : typeof raffleIds === "string"
-      ? raffleIds.split(",").filter(Boolean).length
-      : 0;
-    return `Raffles: ${count || "—"} • ${onlyCompletedText}`;
-  }
-
-  if (mk === "selected_customers") {
-    const count = Array.isArray(customerIds)
-      ? customerIds.length
-      : typeof customerIds === "string"
-      ? customerIds.split(",").filter(Boolean).length
-      : 0;
-    return `Customers: ${count || "—"}`;
-  }
-
-  if (mk === "attempt_status") {
-    const passedText =
-      typeof attemptPassed === "boolean"
-        ? attemptPassed
-          ? "Passed"
-          : "Failed"
-        : "Passed/Failed";
-    return raffleId
-      ? `${passedText} • Raffle: ${formatShortId(raffleId)}`
-      : `${passedText} • All raffles`;
-  }
-
-  return "—";
 }
 
 function Chip({
@@ -246,6 +189,16 @@ function csvEscape(v: string) {
   return mustQuote ? `"${s}"` : s;
 }
 
+function parseUuidArray(v: unknown): string[] {
+  if (Array.isArray(v)) return v.map((x) => safeString(x)).filter(Boolean);
+  if (typeof v === "string")
+    return v
+      .split(/[\s,]+/g)
+      .map((x) => x.trim())
+      .filter(Boolean);
+  return [];
+}
+
 export default function CampaignsPage() {
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -271,7 +224,18 @@ export default function CampaignsPage() {
   const [failures, setFailures] = useState<DeliveryRow[]>([]);
   const [showFailures, setShowFailures] = useState(true);
 
-  // UI toasts (lightweight)
+  // Human-friendly resolvers
+  const [raffleNameById, setRaffleNameById] = useState<Record<string, string>>(
+    {}
+  );
+  const [selectedCustomersPreview, setSelectedCustomersPreview] = useState<{
+    known: CustomerMini[];
+    knownCount: number;
+    unknownCount: number;
+    total: number;
+  } | null>(null);
+
+  // UI toast
   const [toast, setToast] = useState<string | null>(null);
 
   const timeMinIso = useMemo(() => {
@@ -290,6 +254,28 @@ export default function CampaignsPage() {
   const showToast = useCallback((msg: string) => {
     setToast(msg);
     window.setTimeout(() => setToast(null), 2200);
+  }, []);
+
+  const normalizeCampaign = useCallback((row: unknown): CampaignRow => {
+    const obj = (row ?? {}) as Record<string, unknown>;
+    return {
+      id: safeString(obj["id"]),
+      created_at: safeString(obj["created_at"]),
+      created_by: obj["created_by"] ? safeString(obj["created_by"]) : null,
+      mode: safeString(obj["mode"]),
+      title: safeString(obj["title"]),
+      body: safeString(obj["body"]),
+      data: isObject(obj["data"])
+        ? (obj["data"] as Record<string, unknown>)
+        : {},
+      criteria: isObject(obj["criteria"])
+        ? (obj["criteria"] as Record<string, unknown>)
+        : {},
+      recipient_count:
+        typeof obj["recipient_count"] === "number"
+          ? (obj["recipient_count"] as number)
+          : Number(obj["recipient_count"] ?? 0),
+    };
   }, []);
 
   const fetchAggsFor = useCallback(
@@ -335,27 +321,102 @@ export default function CampaignsPage() {
     [aggs]
   );
 
-  const normalizeCampaign = useCallback((row: unknown): CampaignRow => {
-    const obj = (row ?? {}) as Record<string, unknown>;
-    return {
-      id: safeString(obj["id"]),
-      created_at: safeString(obj["created_at"]),
-      created_by: obj["created_by"] ? safeString(obj["created_by"]) : null,
-      mode: safeString(obj["mode"]),
-      title: safeString(obj["title"]),
-      body: safeString(obj["body"]),
-      data: isObject(obj["data"])
-        ? (obj["data"] as Record<string, unknown>)
-        : {},
-      criteria: isObject(obj["criteria"])
-        ? (obj["criteria"] as Record<string, unknown>)
-        : {},
-      recipient_count:
-        typeof obj["recipient_count"] === "number"
-          ? (obj["recipient_count"] as number)
-          : Number(obj["recipient_count"] ?? 0),
-    };
-  }, []);
+  const resolveRaffleNames = useCallback(
+    async (raffleIds: string[]) => {
+      const unknown = raffleIds.filter((id) => id && !raffleNameById[id]);
+      if (unknown.length === 0) return;
+
+      const { data, error } = await supabase
+        .from("raffles")
+        .select("id,item_name")
+        .in("id", unknown)
+        .limit(200);
+
+      if (error) throw error;
+
+      const list = Array.isArray(data) ? (data as unknown[]) : [];
+      const next = { ...raffleNameById };
+
+      for (const r of list) {
+        const obj = (r ?? {}) as Record<string, unknown>;
+        const id = safeString(obj["id"]);
+        const name = safeString(obj["item_name"]);
+        if (id && name) next[id] = name;
+      }
+
+      setRaffleNameById(next);
+    },
+    [raffleNameById]
+  );
+
+  const summarizeCriteriaHuman = useCallback(
+    (mode: string, criteria: Record<string, unknown>): string => {
+      const mk = toModeKey(mode);
+
+      const raffleId = safeString(criteria["raffle_id"]);
+      const raffleIds = parseUuidArray(criteria["raffle_ids"]);
+      const customerIds = parseUuidArray(criteria["customer_ids"]);
+      const attemptPassed = criteria["attempt_passed"];
+      const onlyCompleted = criteria["only_completed_tickets"];
+
+      const onlyCompletedText =
+        typeof onlyCompleted === "boolean"
+          ? onlyCompleted
+            ? "Completed tickets only"
+            : "All tickets"
+          : "Completed tickets only";
+
+      const raffleName = raffleId ? raffleNameById[raffleId] : null;
+
+      if (mk === "all_users") return "Everyone";
+
+      if (mk === "raffle_users") {
+        const label = raffleName
+          ? `${raffleName}`
+          : raffleId
+          ? formatShortId(raffleId)
+          : "—";
+        return `Raffle: ${label} • ${onlyCompletedText}`;
+      }
+
+      if (mk === "multi_raffle_union") {
+        const names = raffleIds
+          .map((id) => raffleNameById[id])
+          .filter(Boolean)
+          .slice(0, 3) as string[];
+
+        const remainder = Math.max(raffleIds.length - names.length, 0);
+        const nameText =
+          names.length > 0
+            ? `${names.join(", ")}${remainder ? ` +${remainder} more` : ""}`
+            : `${raffleIds.length || "—"} raffles`;
+
+        return `Raffles: ${nameText} • ${onlyCompletedText}`;
+      }
+
+      if (mk === "selected_customers") {
+        return `Selected customers: ${customerIds.length || "—"}`;
+      }
+
+      if (mk === "attempt_status") {
+        const passedText =
+          typeof attemptPassed === "boolean"
+            ? attemptPassed
+              ? "Passed"
+              : "Failed"
+            : "Passed/Failed";
+        const scope = raffleName
+          ? raffleName
+          : raffleId
+          ? formatShortId(raffleId)
+          : "All raffles";
+        return `${passedText} • Scope: ${scope}`;
+      }
+
+      return "—";
+    },
+    [raffleNameById]
+  );
 
   const loadPage = useCallback(
     async (opts: { reset: boolean }) => {
@@ -387,13 +448,26 @@ export default function CampaignsPage() {
         const list = Array.isArray(data) ? data : [];
         const normalized = list.map(normalizeCampaign);
 
+        // Resolve raffle IDs found in criteria for more human display
+        const raffleIdsToResolve: string[] = [];
+        for (const c of normalized) {
+          const cr = c.criteria ?? {};
+          const rid = safeString(cr["raffle_id"]);
+          if (rid) raffleIdsToResolve.push(rid);
+          const rids = parseUuidArray(cr["raffle_ids"]);
+          raffleIdsToResolve.push(...rids);
+        }
+        const uniqRaffleIds = Array.from(
+          new Set(raffleIdsToResolve.filter(Boolean))
+        );
+        if (uniqRaffleIds.length) await resolveRaffleNames(uniqRaffleIds);
+
         if (opts.reset) {
           setCampaigns(normalized);
           setPage(1);
         } else {
           setCampaigns((prev) => {
             const merged = [...prev, ...normalized];
-            // de-dupe by id (in case filters change quickly)
             const map = new Map<string, CampaignRow>();
             for (const c of merged) map.set(c.id, c);
             return Array.from(map.values()).sort((a, b) =>
@@ -404,10 +478,8 @@ export default function CampaignsPage() {
         }
 
         setHasMore(normalized.length === PAGE_SIZE);
-
         await fetchAggsFor(normalized.map((c) => c.id));
 
-        // keep selected in sync
         setSelected((prev) => {
           if (!prev) return null;
           const inNew = normalized.find((x) => x.id === prev.id);
@@ -429,14 +501,16 @@ export default function CampaignsPage() {
       page,
       search,
       timeMinIso,
+      resolveRaffleNames,
     ]
   );
 
-  // Reset pagination when filters change
+  // Reset on filter changes
   useEffect(() => {
     setSelected(null);
     setFailures([]);
     setFailuresError(null);
+    setSelectedCustomersPreview(null);
     setHasMore(true);
     setPage(0);
     void loadPage({ reset: true });
@@ -447,6 +521,7 @@ export default function CampaignsPage() {
     setSelected(null);
     setFailures([]);
     setFailuresError(null);
+    setSelectedCustomersPreview(null);
     setHasMore(true);
     setPage(0);
     await loadPage({ reset: true });
@@ -527,18 +602,75 @@ export default function CampaignsPage() {
     }
   }, []);
 
-  // When selecting a campaign, load failures if needed
+  const loadSelectedCustomersPreview = useCallback(
+    async (criteria: Record<string, unknown>) => {
+      const ids = parseUuidArray(criteria["customer_ids"]);
+      const uniq = Array.from(new Set(ids.filter(Boolean)));
+      if (uniq.length === 0) {
+        setSelectedCustomersPreview(null);
+        return;
+      }
+
+      // fetch up to 8 known customers for preview
+      const previewIds = uniq.slice(0, 50);
+      const { data, error } = await supabase
+        .from("customers")
+        .select("id,name,email")
+        .in("id", previewIds)
+        .limit(50);
+
+      if (error) throw error;
+
+      const list = Array.isArray(data) ? (data as unknown[]) : [];
+      const known: CustomerMini[] = list
+        .map((r) => {
+          const obj = (r ?? {}) as Record<string, unknown>;
+          return {
+            id: safeString(obj["id"]),
+            name: safeString(obj["name"]),
+            email: safeString(obj["email"]),
+          };
+        })
+        .filter((x) => x.id);
+
+      const knownIds = new Set(known.map((k) => k.id));
+      const unknownCount = uniq.filter((id) => !knownIds.has(id)).length;
+
+      setSelectedCustomersPreview({
+        known: known.slice(0, 8),
+        knownCount: known.length,
+        unknownCount,
+        total: uniq.length,
+      });
+    },
+    []
+  );
+
+  // when selecting, load failures + customer preview (if relevant)
   useEffect(() => {
     if (!selected) return;
+
+    setSelectedCustomersPreview(null);
+
     const a = aggs[selected.id];
     const failed = a?.failed ?? 0;
-    if (failed > 0 && showFailures) {
-      void loadFailures(selected.id);
-    } else {
+
+    if (failed > 0 && showFailures) void loadFailures(selected.id);
+    else {
       setFailures([]);
       setFailuresError(null);
     }
-  }, [aggs, loadFailures, selected, showFailures]);
+
+    if (toModeKey(selected.mode) === "selected_customers") {
+      void loadSelectedCustomersPreview(selected.criteria ?? {});
+    }
+  }, [
+    aggs,
+    loadFailures,
+    loadSelectedCustomersPreview,
+    selected,
+    showFailures,
+  ]);
 
   const handleCopyCampaignId = useCallback(async () => {
     if (!selected) return;
@@ -569,7 +701,6 @@ export default function CampaignsPage() {
       setFailuresError(null);
       setFailuresLoading(true);
 
-      // Fetch all deliveries for this campaign (cap at 5000 to protect browser)
       const { data, error } = await supabase
         .from("admin_notification_deliveries")
         .select(
@@ -622,8 +753,10 @@ export default function CampaignsPage() {
         lines.push(row.join(","));
       }
 
-      const csv = lines.join("\n");
-      downloadCsv(`snapwin-campaign-${selected.id}-deliveries.csv`, csv);
+      downloadCsv(
+        `snapwin-campaign-${selected.id}-deliveries.csv`,
+        lines.join("\n")
+      );
       showToast("CSV exported");
     } catch (e: unknown) {
       setFailuresError(
@@ -658,8 +791,8 @@ export default function CampaignsPage() {
             Campaigns
           </h1>
           <p className="text-sm mt-1" style={{ color: COLORS.textMuted }}>
-            Human-friendly audit log of notification campaigns and delivery
-            status.
+            Audit log with human-friendly targeting summaries, delivery status,
+            and export.
           </p>
         </div>
 
@@ -795,21 +928,19 @@ export default function CampaignsPage() {
               Campaigns ({rows.length})
             </div>
 
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => void loadPage({ reset: true })}
-                className="rounded px-3 py-1.5 text-xs font-semibold border"
-                style={{
-                  borderColor: COLORS.cardBorder,
-                  backgroundColor: COLORS.screenBg,
-                  color: COLORS.textSecondary,
-                }}
-                disabled={loading}
-              >
-                {loading ? "Loading…" : "Reload list"}
-              </button>
-            </div>
+            <button
+              type="button"
+              onClick={() => void loadPage({ reset: true })}
+              className="rounded px-3 py-1.5 text-xs font-semibold border"
+              style={{
+                borderColor: COLORS.cardBorder,
+                backgroundColor: COLORS.screenBg,
+                color: COLORS.textSecondary,
+              }}
+              disabled={loading}
+            >
+              {loading ? "Loading…" : "Reload list"}
+            </button>
           </div>
 
           {rows.length === 0 ? (
@@ -826,6 +957,7 @@ export default function CampaignsPage() {
             >
               {rows.map(({ c, total, pending, ok, failed }) => {
                 const isActive = selected?.id === c.id;
+
                 return (
                   <button
                     key={c.id}
@@ -861,7 +993,7 @@ export default function CampaignsPage() {
                           className="text-xs mt-1"
                           style={{ color: COLORS.textMuted }}
                         >
-                          {summarizeCriteria(c.mode, c.criteria)}
+                          {summarizeCriteriaHuman(c.mode, c.criteria ?? {})}
                         </div>
 
                         <div
@@ -945,13 +1077,13 @@ export default function CampaignsPage() {
 
         {/* Details */}
         <div
-          className="rounded-2xl border p-4"
+          className="rounded-2xl border p-4 space-y-4"
           style={{
             backgroundColor: COLORS.cardBg,
             borderColor: COLORS.cardBorder,
           }}
         >
-          <div className="flex items-center justify-between gap-3 mb-3">
+          <div className="flex items-center justify-between gap-3">
             <div
               className="text-sm font-semibold"
               style={{ color: COLORS.textPrimary }}
@@ -997,7 +1129,7 @@ export default function CampaignsPage() {
               Select a campaign to view details.
             </div>
           ) : (
-            <div className="space-y-4">
+            <>
               <div>
                 <div
                   className="text-lg font-bold"
@@ -1013,20 +1145,29 @@ export default function CampaignsPage() {
                 </div>
               </div>
 
-              <div className="space-y-1">
+              {/* Message preview */}
+              <div
+                className="rounded-2xl border p-4"
+                style={{
+                  borderColor: COLORS.cardBorder,
+                  backgroundColor: COLORS.screenBg,
+                }}
+              >
                 <div
-                  className="text-xs font-semibold"
+                  className="text-xs font-semibold mb-2"
                   style={{ color: COLORS.textMuted }}
                 >
-                  Message
+                  Message preview
                 </div>
                 <div
-                  className="rounded-xl border p-3 text-sm"
-                  style={{
-                    borderColor: COLORS.cardBorder,
-                    backgroundColor: COLORS.screenBg,
-                    color: COLORS.textPrimary,
-                  }}
+                  className="text-sm font-semibold"
+                  style={{ color: COLORS.textPrimary }}
+                >
+                  {selected.title || "SnapWin"}
+                </div>
+                <div
+                  className="text-sm mt-1"
+                  style={{ color: COLORS.textSecondary }}
                 >
                   {selected.body || "—"}
                 </div>
@@ -1057,13 +1198,14 @@ export default function CampaignsPage() {
                 </div>
               ) : null}
 
+              {/* Human criteria */}
               <div className="space-y-2">
                 <div className="flex items-center justify-between gap-2">
                   <div
                     className="text-xs font-semibold"
                     style={{ color: COLORS.textMuted }}
                   >
-                    Criteria
+                    Targeting
                   </div>
                   <button
                     type="button"
@@ -1076,8 +1218,57 @@ export default function CampaignsPage() {
                 </div>
 
                 <div className="text-sm" style={{ color: COLORS.textPrimary }}>
-                  {summarizeCriteria(selected.mode, selected.criteria)}
+                  {summarizeCriteriaHuman(
+                    selected.mode,
+                    selected.criteria ?? {}
+                  )}
                 </div>
+
+                {toModeKey(selected.mode) === "selected_customers" &&
+                selectedCustomersPreview ? (
+                  <div
+                    className="rounded-xl border p-3"
+                    style={{
+                      borderColor: COLORS.cardBorder,
+                      backgroundColor: COLORS.cardBg,
+                    }}
+                  >
+                    <div
+                      className="text-xs"
+                      style={{ color: COLORS.textMuted }}
+                    >
+                      Total IDs: {selectedCustomersPreview.total} • Known:{" "}
+                      {selectedCustomersPreview.knownCount} • Unknown:{" "}
+                      {selectedCustomersPreview.unknownCount}
+                    </div>
+
+                    {selectedCustomersPreview.known.length ? (
+                      <div className="mt-2 space-y-1">
+                        {selectedCustomersPreview.known.map((c) => (
+                          <div
+                            key={c.id}
+                            className="text-sm"
+                            style={{ color: COLORS.textPrimary }}
+                          >
+                            <span className="font-semibold">
+                              {c.name || "—"}
+                            </span>{" "}
+                            <span style={{ color: COLORS.textMuted }}>
+                              ({c.email})
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div
+                        className="mt-2 text-sm"
+                        style={{ color: COLORS.textMuted }}
+                      >
+                        No matching customer records for the first batch of IDs.
+                      </div>
+                    )}
+                  </div>
+                ) : null}
 
                 <div
                   className="rounded-xl border p-3 text-xs overflow-auto"
@@ -1093,6 +1284,7 @@ export default function CampaignsPage() {
                 </div>
               </div>
 
+              {/* Data payload */}
               <div className="space-y-2">
                 <div className="flex items-center justify-between gap-2">
                   <div
@@ -1237,28 +1429,27 @@ export default function CampaignsPage() {
                     </div>
                   </div>
                 )}
-              </div>
 
-              {/* Quick reload failures */}
-              {selectedAgg && selectedAgg.failed > 0 && showFailures ? (
-                <button
-                  type="button"
-                  onClick={() => void loadFailures(selected.id)}
-                  className="rounded px-4 py-2 text-sm font-semibold border"
-                  style={{
-                    borderColor: COLORS.cardBorder,
-                    backgroundColor: COLORS.screenBg,
-                    color: COLORS.textSecondary,
-                    opacity: failuresLoading ? 0.7 : 1,
-                  }}
-                  disabled={failuresLoading}
-                >
-                  {failuresLoading
-                    ? "Refreshing failures…"
-                    : "Refresh failures"}
-                </button>
-              ) : null}
-            </div>
+                {selectedAgg && selectedAgg.failed > 0 && showFailures ? (
+                  <button
+                    type="button"
+                    onClick={() => void loadFailures(selected.id)}
+                    className="rounded px-4 py-2 text-sm font-semibold border"
+                    style={{
+                      borderColor: COLORS.cardBorder,
+                      backgroundColor: COLORS.screenBg,
+                      color: COLORS.textSecondary,
+                      opacity: failuresLoading ? 0.7 : 1,
+                    }}
+                    disabled={failuresLoading}
+                  >
+                    {failuresLoading
+                      ? "Refreshing failures…"
+                      : "Refresh failures"}
+                  </button>
+                ) : null}
+              </div>
+            </>
           )}
         </div>
       </div>
