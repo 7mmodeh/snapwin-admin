@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
 
@@ -14,20 +15,6 @@ type CampaignRow = {
   data: Record<string, unknown>;
   criteria: Record<string, unknown>;
   recipient_count: number;
-};
-
-type DeliveryRow = {
-  id: string;
-  created_at: string;
-  campaign_id: string;
-  customer_id: string;
-  expo_push_token: string | null;
-  in_app_inserted: boolean;
-  push_attempted: boolean;
-  push_ok: boolean;
-  push_provider: string | null;
-  push_response: Record<string, unknown> | null;
-  error: string | null;
 };
 
 type DeliveryAgg = {
@@ -45,9 +32,6 @@ type ModeKey =
   | "attempt_status"
   | "multi_raffle_union"
   | "unknown";
-
-// type RafflePick = { id: string; item_name: string };
-type CustomerMini = { id: string; name: string; email: string };
 
 function toModeKey(v: string): ModeKey {
   const x = (v ?? "").trim();
@@ -125,12 +109,15 @@ function Chip({
   tone: "neutral" | "good" | "warn" | "bad";
 }) {
   const styles = (() => {
-    if (tone === "good")
+    if (tone === "good") {
       return { bg: "#ECFDF5", border: "#6EE7B7", text: "#065F46" };
-    if (tone === "warn")
+    }
+    if (tone === "warn") {
       return { bg: "#FFFBEB", border: "#FDE68A", text: "#92400E" };
-    if (tone === "bad")
+    }
+    if (tone === "bad") {
       return { bg: "#FEF2F2", border: "#FCA5A5", text: "#991B1B" };
+    }
     return {
       bg: COLORS.highlightCardBg,
       border: COLORS.cardBorder,
@@ -153,42 +140,6 @@ function Chip({
   );
 }
 
-async function copyToClipboard(text: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function jsonPreview(
-  obj: Record<string, unknown> | null | undefined,
-  max = 220
-) {
-  const s = JSON.stringify(obj ?? {}, null, 0);
-  return s.length > max ? `${s.slice(0, max)}…` : s;
-}
-
-function downloadCsv(filename: string, csv: string) {
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-function csvEscape(v: string) {
-  const mustQuote =
-    v.includes(",") || v.includes("\n") || v.includes('"') || v.includes("\r");
-  const s = v.replace(/"/g, '""');
-  return mustQuote ? `"${s}"` : s;
-}
-
 function parseUuidArray(v: unknown): string[] {
   if (Array.isArray(v)) return v.map((x) => safeString(x)).filter(Boolean);
   if (typeof v === "string")
@@ -200,6 +151,8 @@ function parseUuidArray(v: unknown): string[] {
 }
 
 export default function CampaignsPage() {
+  const router = useRouter();
+
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -216,27 +169,10 @@ export default function CampaignsPage() {
   const [modeFilter, setModeFilter] = useState<ModeKey | "all">("all");
   const [range, setRange] = useState<"today" | "7d" | "30d" | "all">("7d");
 
-  const [selected, setSelected] = useState<CampaignRow | null>(null);
-
-  // Details: failures list
-  const [failuresLoading, setFailuresLoading] = useState(false);
-  const [failuresError, setFailuresError] = useState<string | null>(null);
-  const [failures, setFailures] = useState<DeliveryRow[]>([]);
-  const [showFailures, setShowFailures] = useState(true);
-
   // Human-friendly resolvers
   const [raffleNameById, setRaffleNameById] = useState<Record<string, string>>(
     {}
   );
-  const [selectedCustomersPreview, setSelectedCustomersPreview] = useState<{
-    known: CustomerMini[];
-    knownCount: number;
-    unknownCount: number;
-    total: number;
-  } | null>(null);
-
-  // UI toast
-  const [toast, setToast] = useState<string | null>(null);
 
   const timeMinIso = useMemo(() => {
     if (range === "all") return null;
@@ -250,11 +186,6 @@ export default function CampaignsPage() {
     const d = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
     return d.toISOString();
   }, [range]);
-
-  const showToast = useCallback((msg: string) => {
-    setToast(msg);
-    window.setTimeout(() => setToast(null), 2200);
-  }, []);
 
   const normalizeCampaign = useCallback((row: unknown): CampaignRow => {
     const obj = (row ?? {}) as Record<string, unknown>;
@@ -290,7 +221,7 @@ export default function CampaignsPage() {
       if (error) throw error;
 
       const rows = Array.isArray(data) ? (data as unknown[]) : [];
-      const next = { ...aggs };
+      const next: Record<string, DeliveryAgg> = { ...aggs };
 
       for (const r of rows) {
         const obj = (r ?? {}) as Record<string, unknown>;
@@ -372,7 +303,7 @@ export default function CampaignsPage() {
 
       if (mk === "raffle_users") {
         const label = raffleName
-          ? `${raffleName}`
+          ? raffleName
           : raffleId
           ? formatShortId(raffleId)
           : "—";
@@ -479,12 +410,6 @@ export default function CampaignsPage() {
 
         setHasMore(normalized.length === PAGE_SIZE);
         await fetchAggsFor(normalized.map((c) => c.id));
-
-        setSelected((prev) => {
-          if (!prev) return null;
-          const inNew = normalized.find((x) => x.id === prev.id);
-          return inNew ?? prev;
-        });
       } catch (e: unknown) {
         setErrorMsg(
           e instanceof Error ? e.message : "Failed to load campaigns."
@@ -507,10 +432,6 @@ export default function CampaignsPage() {
 
   // Reset on filter changes
   useEffect(() => {
-    setSelected(null);
-    setFailures([]);
-    setFailuresError(null);
-    setSelectedCustomersPreview(null);
     setHasMore(true);
     setPage(0);
     void loadPage({ reset: true });
@@ -518,10 +439,6 @@ export default function CampaignsPage() {
   }, [search, modeFilter, range]);
 
   const refresh = useCallback(async () => {
-    setSelected(null);
-    setFailures([]);
-    setFailuresError(null);
-    setSelectedCustomersPreview(null);
     setHasMore(true);
     setPage(0);
     await loadPage({ reset: true });
@@ -538,250 +455,8 @@ export default function CampaignsPage() {
     });
   }, [campaigns, aggs]);
 
-  const selectedAgg = useMemo(() => {
-    if (!selected) return null;
-    const a = aggs[selected.id];
-    return {
-      total: a?.total ?? selected.recipient_count ?? 0,
-      pending: a?.pending ?? 0,
-      ok: a?.ok ?? 0,
-      failed: a?.failed ?? 0,
-    };
-  }, [aggs, selected]);
-
-  const loadFailures = useCallback(async (campaignId: string) => {
-    setFailures([]);
-    setFailuresError(null);
-    setFailuresLoading(true);
-
-    try {
-      const { data, error } = await supabase
-        .from("admin_notification_deliveries")
-        .select(
-          "id,created_at,campaign_id,customer_id,expo_push_token,in_app_inserted,push_attempted,push_ok,push_provider,push_response,error"
-        )
-        .eq("campaign_id", campaignId)
-        .eq("push_attempted", true)
-        .eq("push_ok", false)
-        .order("created_at", { ascending: false })
-        .limit(50);
-
-      if (error) throw error;
-
-      const list = Array.isArray(data) ? (data as unknown[]) : [];
-      const normalized: DeliveryRow[] = list.map((r) => {
-        const obj = (r ?? {}) as Record<string, unknown>;
-        return {
-          id: safeString(obj["id"]),
-          created_at: safeString(obj["created_at"]),
-          campaign_id: safeString(obj["campaign_id"]),
-          customer_id: safeString(obj["customer_id"]),
-          expo_push_token: obj["expo_push_token"]
-            ? safeString(obj["expo_push_token"])
-            : null,
-          in_app_inserted: Boolean(obj["in_app_inserted"]),
-          push_attempted: Boolean(obj["push_attempted"]),
-          push_ok: Boolean(obj["push_ok"]),
-          push_provider: obj["push_provider"]
-            ? safeString(obj["push_provider"])
-            : null,
-          push_response: isObject(obj["push_response"])
-            ? (obj["push_response"] as Record<string, unknown>)
-            : null,
-          error: obj["error"] ? safeString(obj["error"]) : null,
-        };
-      });
-
-      setFailures(normalized);
-    } catch (e: unknown) {
-      setFailuresError(
-        e instanceof Error ? e.message : "Failed to load failures."
-      );
-    } finally {
-      setFailuresLoading(false);
-    }
-  }, []);
-
-  const loadSelectedCustomersPreview = useCallback(
-    async (criteria: Record<string, unknown>) => {
-      const ids = parseUuidArray(criteria["customer_ids"]);
-      const uniq = Array.from(new Set(ids.filter(Boolean)));
-      if (uniq.length === 0) {
-        setSelectedCustomersPreview(null);
-        return;
-      }
-
-      // fetch up to 8 known customers for preview
-      const previewIds = uniq.slice(0, 50);
-      const { data, error } = await supabase
-        .from("customers")
-        .select("id,name,email")
-        .in("id", previewIds)
-        .limit(50);
-
-      if (error) throw error;
-
-      const list = Array.isArray(data) ? (data as unknown[]) : [];
-      const known: CustomerMini[] = list
-        .map((r) => {
-          const obj = (r ?? {}) as Record<string, unknown>;
-          return {
-            id: safeString(obj["id"]),
-            name: safeString(obj["name"]),
-            email: safeString(obj["email"]),
-          };
-        })
-        .filter((x) => x.id);
-
-      const knownIds = new Set(known.map((k) => k.id));
-      const unknownCount = uniq.filter((id) => !knownIds.has(id)).length;
-
-      setSelectedCustomersPreview({
-        known: known.slice(0, 8),
-        knownCount: known.length,
-        unknownCount,
-        total: uniq.length,
-      });
-    },
-    []
-  );
-
-  // when selecting, load failures + customer preview (if relevant)
-  useEffect(() => {
-    if (!selected) return;
-
-    setSelectedCustomersPreview(null);
-
-    const a = aggs[selected.id];
-    const failed = a?.failed ?? 0;
-
-    if (failed > 0 && showFailures) void loadFailures(selected.id);
-    else {
-      setFailures([]);
-      setFailuresError(null);
-    }
-
-    if (toModeKey(selected.mode) === "selected_customers") {
-      void loadSelectedCustomersPreview(selected.criteria ?? {});
-    }
-  }, [
-    aggs,
-    loadFailures,
-    loadSelectedCustomersPreview,
-    selected,
-    showFailures,
-  ]);
-
-  const handleCopyCampaignId = useCallback(async () => {
-    if (!selected) return;
-    const ok = await copyToClipboard(selected.id);
-    showToast(ok ? "Campaign ID copied" : "Copy failed");
-  }, [selected, showToast]);
-
-  const handleCopyCriteria = useCallback(async () => {
-    if (!selected) return;
-    const ok = await copyToClipboard(
-      JSON.stringify(selected.criteria ?? {}, null, 2)
-    );
-    showToast(ok ? "Criteria copied" : "Copy failed");
-  }, [selected, showToast]);
-
-  const handleCopyData = useCallback(async () => {
-    if (!selected) return;
-    const ok = await copyToClipboard(
-      JSON.stringify(selected.data ?? {}, null, 2)
-    );
-    showToast(ok ? "Data copied" : "Copy failed");
-  }, [selected, showToast]);
-
-  const exportDeliveriesCsv = useCallback(async () => {
-    if (!selected) return;
-
-    try {
-      setFailuresError(null);
-      setFailuresLoading(true);
-
-      const { data, error } = await supabase
-        .from("admin_notification_deliveries")
-        .select(
-          "id,created_at,campaign_id,customer_id,expo_push_token,in_app_inserted,push_attempted,push_ok,push_provider,error,push_response"
-        )
-        .eq("campaign_id", selected.id)
-        .order("created_at", { ascending: false })
-        .limit(5000);
-
-      if (error) throw error;
-
-      const list = Array.isArray(data) ? (data as unknown[]) : [];
-
-      const header = [
-        "id",
-        "created_at",
-        "campaign_id",
-        "customer_id",
-        "expo_push_token",
-        "in_app_inserted",
-        "push_attempted",
-        "push_ok",
-        "push_provider",
-        "error",
-        "push_response_json",
-      ];
-
-      const lines: string[] = [];
-      lines.push(header.join(","));
-
-      for (const r of list) {
-        const obj = (r ?? {}) as Record<string, unknown>;
-        const pushResp = isObject(obj["push_response"])
-          ? JSON.stringify(obj["push_response"])
-          : safeString(obj["push_response"]);
-        const row = [
-          safeString(obj["id"]),
-          safeString(obj["created_at"]),
-          safeString(obj["campaign_id"]),
-          safeString(obj["customer_id"]),
-          obj["expo_push_token"] ? safeString(obj["expo_push_token"]) : "",
-          String(Boolean(obj["in_app_inserted"])),
-          String(Boolean(obj["push_attempted"])),
-          String(Boolean(obj["push_ok"])),
-          obj["push_provider"] ? safeString(obj["push_provider"]) : "",
-          obj["error"] ? safeString(obj["error"]) : "",
-          pushResp || "",
-        ].map(csvEscape);
-
-        lines.push(row.join(","));
-      }
-
-      downloadCsv(
-        `snapwin-campaign-${selected.id}-deliveries.csv`,
-        lines.join("\n")
-      );
-      showToast("CSV exported");
-    } catch (e: unknown) {
-      setFailuresError(
-        e instanceof Error ? e.message : "Failed to export CSV."
-      );
-    } finally {
-      setFailuresLoading(false);
-    }
-  }, [selected, showToast]);
-
   return (
     <div className="space-y-6">
-      {toast ? (
-        <div
-          className="fixed top-4 right-4 z-50 rounded-xl border px-4 py-2 text-sm shadow"
-          style={{
-            backgroundColor: COLORS.cardBg,
-            borderColor: COLORS.cardBorder,
-            color: COLORS.textPrimary,
-          }}
-        >
-          {toast}
-        </div>
-      ) : null}
-
       <div className="flex items-start justify-between gap-4">
         <div>
           <h1
@@ -791,8 +466,8 @@ export default function CampaignsPage() {
             Campaigns
           </h1>
           <p className="text-sm mt-1" style={{ color: COLORS.textMuted }}>
-            Audit log with human-friendly targeting summaries, delivery status,
-            and export.
+            Click a campaign to open its audit view (deliveries, failures,
+            export).
           </p>
         </div>
 
@@ -956,18 +631,16 @@ export default function CampaignsPage() {
               style={{ borderColor: COLORS.cardBorder }}
             >
               {rows.map(({ c, total, pending, ok, failed }) => {
-                const isActive = selected?.id === c.id;
-
                 return (
                   <button
                     key={c.id}
                     type="button"
-                    onClick={() => setSelected(c)}
+                    onClick={() =>
+                      router.push(`/notifications/campaigns/${c.id}`)
+                    }
                     className="w-full text-left px-4 py-4 transition"
                     style={{
-                      backgroundColor: isActive
-                        ? COLORS.highlightCardBg
-                        : COLORS.cardBg,
+                      backgroundColor: COLORS.cardBg,
                       color: COLORS.textPrimary,
                     }}
                   >
@@ -1075,382 +748,46 @@ export default function CampaignsPage() {
           </div>
         </div>
 
-        {/* Details */}
+        {/* Right panel: instructions */}
         <div
-          className="rounded-2xl border p-4 space-y-4"
+          className="rounded-2xl border p-4 space-y-3"
           style={{
             backgroundColor: COLORS.cardBg,
             borderColor: COLORS.cardBorder,
           }}
         >
-          <div className="flex items-center justify-between gap-3">
-            <div
-              className="text-sm font-semibold"
-              style={{ color: COLORS.textPrimary }}
-            >
-              Details
-            </div>
-
-            {selected ? (
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={handleCopyCampaignId}
-                  className="rounded px-3 py-1.5 text-xs font-semibold border"
-                  style={{
-                    borderColor: COLORS.cardBorder,
-                    backgroundColor: COLORS.screenBg,
-                    color: COLORS.textSecondary,
-                  }}
-                >
-                  Copy ID
-                </button>
-
-                <button
-                  type="button"
-                  onClick={exportDeliveriesCsv}
-                  className="rounded px-3 py-1.5 text-xs font-semibold border"
-                  style={{
-                    borderColor: COLORS.cardBorder,
-                    backgroundColor: COLORS.screenBg,
-                    color: COLORS.textSecondary,
-                    opacity: failuresLoading ? 0.7 : 1,
-                  }}
-                  disabled={failuresLoading}
-                >
-                  Export CSV
-                </button>
-              </div>
-            ) : null}
+          <div
+            className="text-sm font-semibold"
+            style={{ color: COLORS.textPrimary }}
+          >
+            How to use
           </div>
 
-          {!selected ? (
-            <div className="text-sm" style={{ color: COLORS.textMuted }}>
-              Select a campaign to view details.
-            </div>
-          ) : (
-            <>
-              <div>
-                <div
-                  className="text-lg font-bold"
-                  style={{ color: COLORS.textPrimary }}
-                >
-                  {selected.title || "Untitled"}
-                </div>
-                <div
-                  className="text-xs mt-1"
-                  style={{ color: COLORS.textMuted }}
-                >
-                  {modeLabel(selected.mode)} • {formatDate(selected.created_at)}
-                </div>
-              </div>
+          <div className="text-sm" style={{ color: COLORS.textSecondary }}>
+            Click any campaign to open its audit view. There you can:
+          </div>
 
-              {/* Message preview */}
-              <div
-                className="rounded-2xl border p-4"
-                style={{
-                  borderColor: COLORS.cardBorder,
-                  backgroundColor: COLORS.screenBg,
-                }}
-              >
-                <div
-                  className="text-xs font-semibold mb-2"
-                  style={{ color: COLORS.textMuted }}
-                >
-                  Message preview
-                </div>
-                <div
-                  className="text-sm font-semibold"
-                  style={{ color: COLORS.textPrimary }}
-                >
-                  {selected.title || "SnapWin"}
-                </div>
-                <div
-                  className="text-sm mt-1"
-                  style={{ color: COLORS.textSecondary }}
-                >
-                  {selected.body || "—"}
-                </div>
-              </div>
+          <ul
+            className="list-disc pl-5 text-sm space-y-1"
+            style={{ color: COLORS.textSecondary }}
+          >
+            <li>See per-recipient delivery outcomes</li>
+            <li>Filter pending / OK / failed</li>
+            <li>Export deliveries to CSV</li>
+            <li>Copy campaign ID for support/debugging</li>
+          </ul>
 
-              {selectedAgg ? (
-                <div className="flex flex-wrap gap-2">
-                  <Chip
-                    label="Recipients"
-                    value={selectedAgg.total}
-                    tone="neutral"
-                  />
-                  <Chip
-                    label="Pending"
-                    value={selectedAgg.pending}
-                    tone={selectedAgg.pending > 0 ? "warn" : "neutral"}
-                  />
-                  <Chip
-                    label="OK"
-                    value={selectedAgg.ok}
-                    tone={selectedAgg.ok > 0 ? "good" : "neutral"}
-                  />
-                  <Chip
-                    label="Failed"
-                    value={selectedAgg.failed}
-                    tone={selectedAgg.failed > 0 ? "bad" : "neutral"}
-                  />
-                </div>
-              ) : null}
-
-              {/* Human criteria */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between gap-2">
-                  <div
-                    className="text-xs font-semibold"
-                    style={{ color: COLORS.textMuted }}
-                  >
-                    Targeting
-                  </div>
-                  <button
-                    type="button"
-                    onClick={handleCopyCriteria}
-                    className="text-xs underline"
-                    style={{ color: COLORS.textMuted }}
-                  >
-                    Copy JSON
-                  </button>
-                </div>
-
-                <div className="text-sm" style={{ color: COLORS.textPrimary }}>
-                  {summarizeCriteriaHuman(
-                    selected.mode,
-                    selected.criteria ?? {}
-                  )}
-                </div>
-
-                {toModeKey(selected.mode) === "selected_customers" &&
-                selectedCustomersPreview ? (
-                  <div
-                    className="rounded-xl border p-3"
-                    style={{
-                      borderColor: COLORS.cardBorder,
-                      backgroundColor: COLORS.cardBg,
-                    }}
-                  >
-                    <div
-                      className="text-xs"
-                      style={{ color: COLORS.textMuted }}
-                    >
-                      Total IDs: {selectedCustomersPreview.total} • Known:{" "}
-                      {selectedCustomersPreview.knownCount} • Unknown:{" "}
-                      {selectedCustomersPreview.unknownCount}
-                    </div>
-
-                    {selectedCustomersPreview.known.length ? (
-                      <div className="mt-2 space-y-1">
-                        {selectedCustomersPreview.known.map((c) => (
-                          <div
-                            key={c.id}
-                            className="text-sm"
-                            style={{ color: COLORS.textPrimary }}
-                          >
-                            <span className="font-semibold">
-                              {c.name || "—"}
-                            </span>{" "}
-                            <span style={{ color: COLORS.textMuted }}>
-                              ({c.email})
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div
-                        className="mt-2 text-sm"
-                        style={{ color: COLORS.textMuted }}
-                      >
-                        No matching customer records for the first batch of IDs.
-                      </div>
-                    )}
-                  </div>
-                ) : null}
-
-                <div
-                  className="rounded-xl border p-3 text-xs overflow-auto"
-                  style={{
-                    borderColor: COLORS.cardBorder,
-                    backgroundColor: COLORS.screenBg,
-                    color: COLORS.textSecondary,
-                    maxHeight: 160,
-                  }}
-                  title={JSON.stringify(selected.criteria ?? {}, null, 2)}
-                >
-                  {jsonPreview(selected.criteria, 600)}
-                </div>
-              </div>
-
-              {/* Data payload */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between gap-2">
-                  <div
-                    className="text-xs font-semibold"
-                    style={{ color: COLORS.textMuted }}
-                  >
-                    Data payload
-                  </div>
-                  <button
-                    type="button"
-                    onClick={handleCopyData}
-                    className="text-xs underline"
-                    style={{ color: COLORS.textMuted }}
-                  >
-                    Copy JSON
-                  </button>
-                </div>
-
-                <div
-                  className="rounded-xl border p-3 text-xs overflow-auto"
-                  style={{
-                    borderColor: COLORS.cardBorder,
-                    backgroundColor: COLORS.screenBg,
-                    color: COLORS.textSecondary,
-                    maxHeight: 160,
-                  }}
-                  title={JSON.stringify(selected.data ?? {}, null, 2)}
-                >
-                  {jsonPreview(selected.data, 600)}
-                </div>
-              </div>
-
-              {/* Failures */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between gap-2">
-                  <div
-                    className="text-xs font-semibold"
-                    style={{ color: COLORS.textMuted }}
-                  >
-                    Delivery failures
-                  </div>
-
-                  <label
-                    className="flex items-center gap-2 text-xs"
-                    style={{ color: COLORS.textMuted }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={showFailures}
-                      onChange={(e) => setShowFailures(e.target.checked)}
-                    />
-                    Show failures
-                  </label>
-                </div>
-
-                {!showFailures ? (
-                  <div className="text-sm" style={{ color: COLORS.textMuted }}>
-                    Failures hidden.
-                  </div>
-                ) : failuresLoading ? (
-                  <div className="text-sm" style={{ color: COLORS.textMuted }}>
-                    Loading failures…
-                  </div>
-                ) : failuresError ? (
-                  <div
-                    className="rounded px-3 py-2 text-sm border"
-                    style={{
-                      backgroundColor: "#FEF2F2",
-                      borderColor: "#FCA5A5",
-                      color: COLORS.error,
-                    }}
-                  >
-                    {failuresError}
-                  </div>
-                ) : failures.length === 0 ? (
-                  <div className="text-sm" style={{ color: COLORS.textMuted }}>
-                    No failures found (or failures not loaded yet).
-                  </div>
-                ) : (
-                  <div
-                    className="rounded-xl border overflow-hidden"
-                    style={{ borderColor: COLORS.cardBorder }}
-                  >
-                    <div
-                      className="px-3 py-2 text-xs border-b"
-                      style={{
-                        borderColor: COLORS.cardBorder,
-                        color: COLORS.textMuted,
-                        backgroundColor: COLORS.screenBg,
-                      }}
-                    >
-                      Showing latest {failures.length} failed deliveries (max
-                      50)
-                    </div>
-
-                    <div
-                      className="divide-y"
-                      style={{ borderColor: COLORS.cardBorder }}
-                    >
-                      {failures.map((f) => (
-                        <div key={f.id} className="px-3 py-2">
-                          <div className="flex items-start justify-between gap-2">
-                            <div
-                              className="text-xs"
-                              style={{ color: COLORS.textMuted }}
-                            >
-                              {formatDate(f.created_at)} • Customer:{" "}
-                              {formatShortId(f.customer_id)}
-                            </div>
-                            <div
-                              className="text-xs"
-                              style={{ color: COLORS.textMuted }}
-                            >
-                              {f.push_provider ?? "expo"}
-                            </div>
-                          </div>
-
-                          <div
-                            className="mt-1 text-sm"
-                            style={{ color: COLORS.textPrimary }}
-                          >
-                            {f.error
-                              ? f.error
-                              : "Push failed (no error message stored)"}
-                          </div>
-
-                          {f.push_response ? (
-                            <div
-                              className="mt-2 rounded-lg border p-2 text-xs overflow-auto"
-                              style={{
-                                borderColor: COLORS.cardBorder,
-                                backgroundColor: COLORS.screenBg,
-                                color: COLORS.textSecondary,
-                                maxHeight: 120,
-                              }}
-                            >
-                              {jsonPreview(f.push_response, 500)}
-                            </div>
-                          ) : null}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {selectedAgg && selectedAgg.failed > 0 && showFailures ? (
-                  <button
-                    type="button"
-                    onClick={() => void loadFailures(selected.id)}
-                    className="rounded px-4 py-2 text-sm font-semibold border"
-                    style={{
-                      borderColor: COLORS.cardBorder,
-                      backgroundColor: COLORS.screenBg,
-                      color: COLORS.textSecondary,
-                      opacity: failuresLoading ? 0.7 : 1,
-                    }}
-                    disabled={failuresLoading}
-                  >
-                    {failuresLoading
-                      ? "Refreshing failures…"
-                      : "Refresh failures"}
-                  </button>
-                ) : null}
-              </div>
-            </>
-          )}
+          <div
+            className="rounded-xl border p-3 text-xs"
+            style={{
+              borderColor: COLORS.cardBorder,
+              backgroundColor: COLORS.screenBg,
+              color: COLORS.textMuted,
+            }}
+          >
+            Tip: Use “Search” + “Mode” + “Time range” to find a specific send
+            quickly.
+          </div>
         </div>
       </div>
     </div>
