@@ -16,6 +16,20 @@ type CampaignRow = {
   recipient_count: number;
 };
 
+type DeliveryRow = {
+  id: string;
+  created_at: string;
+  campaign_id: string;
+  customer_id: string;
+  expo_push_token: string | null;
+  in_app_inserted: boolean;
+  push_attempted: boolean;
+  push_ok: boolean;
+  push_provider: string | null;
+  push_response: Record<string, unknown> | null;
+  error: string | null;
+};
+
 type DeliveryAgg = {
   campaign_id: string;
   total: number;
@@ -69,6 +83,10 @@ function safeString(v: unknown): string {
   return String(v);
 }
 
+function isObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
 function formatShortId(id: string) {
   return id.length > 14 ? `${id.slice(0, 10)}…${id.slice(-4)}` : id;
 }
@@ -94,18 +112,12 @@ function timeAgo(iso: string) {
   return `${days}d ago`;
 }
 
-function isObject(v: unknown): v is Record<string, unknown> {
-  return !!v && typeof v === "object" && !Array.isArray(v);
-}
-
 function summarizeCriteria(
   mode: string,
   criteria: Record<string, unknown>
 ): string {
   const mk = toModeKey(mode);
 
-  // Your campaigns table has a generic "criteria" jsonb.
-  // We’ll read common keys, but stay tolerant to missing/unknown shapes.
   const raffleId = safeString(criteria["raffle_id"]);
   const raffleIds = criteria["raffle_ids"];
   const customerIds = criteria["customer_ids"];
@@ -170,15 +182,12 @@ function Chip({
   tone: "neutral" | "good" | "warn" | "bad";
 }) {
   const styles = (() => {
-    if (tone === "good") {
+    if (tone === "good")
       return { bg: "#ECFDF5", border: "#6EE7B7", text: "#065F46" };
-    }
-    if (tone === "warn") {
+    if (tone === "warn")
       return { bg: "#FFFBEB", border: "#FDE68A", text: "#92400E" };
-    }
-    if (tone === "bad") {
+    if (tone === "bad")
       return { bg: "#FEF2F2", border: "#FCA5A5", text: "#991B1B" };
-    }
     return {
       bg: COLORS.highlightCardBg,
       border: COLORS.cardBorder,
@@ -201,9 +210,50 @@ function Chip({
   );
 }
 
+async function copyToClipboard(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function jsonPreview(
+  obj: Record<string, unknown> | null | undefined,
+  max = 220
+) {
+  const s = JSON.stringify(obj ?? {}, null, 0);
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+function downloadCsv(filename: string, csv: string) {
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function csvEscape(v: string) {
+  const mustQuote =
+    v.includes(",") || v.includes("\n") || v.includes('"') || v.includes("\r");
+  const s = v.replace(/"/g, '""');
+  return mustQuote ? `"${s}"` : s;
+}
+
 export default function CampaignsPage() {
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  // Pagination
+  const PAGE_SIZE = 50;
+  const [page, setPage] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
 
   const [campaigns, setCampaigns] = useState<CampaignRow[]>([]);
   const [aggs, setAggs] = useState<Record<string, DeliveryAgg>>({});
@@ -214,6 +264,15 @@ export default function CampaignsPage() {
   const [range, setRange] = useState<"today" | "7d" | "30d" | "all">("7d");
 
   const [selected, setSelected] = useState<CampaignRow | null>(null);
+
+  // Details: failures list
+  const [failuresLoading, setFailuresLoading] = useState(false);
+  const [failuresError, setFailuresError] = useState<string | null>(null);
+  const [failures, setFailures] = useState<DeliveryRow[]>([]);
+  const [showFailures, setShowFailures] = useState(true);
+
+  // UI toasts (lightweight)
+  const [toast, setToast] = useState<string | null>(null);
 
   const timeMinIso = useMemo(() => {
     if (range === "all") return null;
@@ -228,117 +287,170 @@ export default function CampaignsPage() {
     return d.toISOString();
   }, [range]);
 
-  const fetchAggs = useCallback(async (campaignIds: string[]) => {
-    if (campaignIds.length === 0) {
-      setAggs({});
-      return;
-    }
-
-    // We aggregate deliveries client-side (simple + reliable).
-    const { data, error } = await supabase
-      .from("admin_notification_deliveries")
-      .select("campaign_id,push_attempted,push_ok")
-      .in("campaign_id", campaignIds);
-
-    if (error) throw error;
-
-    const rows = Array.isArray(data) ? (data as unknown[]) : [];
-    const next: Record<string, DeliveryAgg> = {};
-
-    for (const r of rows) {
-      const obj = (r ?? {}) as Record<string, unknown>;
-      const campaign_id = safeString(obj["campaign_id"]);
-      if (!campaign_id) continue;
-
-      const push_attempted = Boolean(obj["push_attempted"]);
-      const push_ok = Boolean(obj["push_ok"]);
-
-      if (!next[campaign_id]) {
-        next[campaign_id] = {
-          campaign_id,
-          total: 0,
-          pending: 0,
-          ok: 0,
-          failed: 0,
-        };
-      }
-
-      next[campaign_id].total += 1;
-
-      if (!push_attempted) next[campaign_id].pending += 1;
-      else if (push_ok) next[campaign_id].ok += 1;
-      else next[campaign_id].failed += 1;
-    }
-
-    setAggs(next);
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    window.setTimeout(() => setToast(null), 2200);
   }, []);
 
-  const load = useCallback(async () => {
-    setErrorMsg(null);
-    setLoading(true);
+  const fetchAggsFor = useCallback(
+    async (campaignIds: string[]) => {
+      if (campaignIds.length === 0) return;
 
-    try {
-      let q = supabase
-        .from("admin_notification_campaigns")
-        .select(
-          "id,created_at,created_by,mode,title,body,data,criteria,recipient_count"
-        )
-        .order("created_at", { ascending: false })
-        .limit(200);
+      const { data, error } = await supabase
+        .from("admin_notification_deliveries")
+        .select("campaign_id,push_attempted,push_ok")
+        .in("campaign_id", campaignIds);
 
-      if (timeMinIso) q = q.gte("created_at", timeMinIso);
-
-      if (modeFilter !== "all") q = q.eq("mode", modeFilter);
-
-      const s = search.trim();
-      if (s) {
-        // Simple search over title/body (case-insensitive) via ilike
-        q = q.or(`title.ilike.%${s}%,body.ilike.%${s}%`);
-      }
-
-      const { data, error } = await q;
       if (error) throw error;
 
-      const list = Array.isArray(data) ? (data as unknown[]) : [];
-      const normalized: CampaignRow[] = list.map((row) => {
-        const obj = (row ?? {}) as Record<string, unknown>;
-        return {
-          id: safeString(obj["id"]),
-          created_at: safeString(obj["created_at"]),
-          created_by: obj["created_by"] ? safeString(obj["created_by"]) : null,
-          mode: safeString(obj["mode"]),
-          title: safeString(obj["title"]),
-          body: safeString(obj["body"]),
-          data: isObject(obj["data"])
-            ? (obj["data"] as Record<string, unknown>)
-            : {},
-          criteria: isObject(obj["criteria"])
-            ? (obj["criteria"] as Record<string, unknown>)
-            : {},
-          recipient_count:
-            typeof obj["recipient_count"] === "number"
-              ? (obj["recipient_count"] as number)
-              : Number(obj["recipient_count"] ?? 0),
-        };
-      });
+      const rows = Array.isArray(data) ? (data as unknown[]) : [];
+      const next = { ...aggs };
 
-      setCampaigns(normalized);
-      await fetchAggs(normalized.map((c) => c.id));
+      for (const r of rows) {
+        const obj = (r ?? {}) as Record<string, unknown>;
+        const campaign_id = safeString(obj["campaign_id"]);
+        if (!campaign_id) continue;
 
-      // keep selected in sync if list changes
-      setSelected((prev) =>
-        prev ? normalized.find((x) => x.id === prev.id) ?? null : null
-      );
-    } catch (e: unknown) {
-      setErrorMsg(e instanceof Error ? e.message : "Failed to load campaigns.");
-    } finally {
-      setLoading(false);
-    }
-  }, [fetchAggs, modeFilter, search, timeMinIso]);
+        const push_attempted = Boolean(obj["push_attempted"]);
+        const push_ok = Boolean(obj["push_ok"]);
 
+        if (!next[campaign_id]) {
+          next[campaign_id] = {
+            campaign_id,
+            total: 0,
+            pending: 0,
+            ok: 0,
+            failed: 0,
+          };
+        }
+
+        next[campaign_id].total += 1;
+        if (!push_attempted) next[campaign_id].pending += 1;
+        else if (push_ok) next[campaign_id].ok += 1;
+        else next[campaign_id].failed += 1;
+      }
+
+      setAggs(next);
+    },
+    [aggs]
+  );
+
+  const normalizeCampaign = useCallback((row: unknown): CampaignRow => {
+    const obj = (row ?? {}) as Record<string, unknown>;
+    return {
+      id: safeString(obj["id"]),
+      created_at: safeString(obj["created_at"]),
+      created_by: obj["created_by"] ? safeString(obj["created_by"]) : null,
+      mode: safeString(obj["mode"]),
+      title: safeString(obj["title"]),
+      body: safeString(obj["body"]),
+      data: isObject(obj["data"])
+        ? (obj["data"] as Record<string, unknown>)
+        : {},
+      criteria: isObject(obj["criteria"])
+        ? (obj["criteria"] as Record<string, unknown>)
+        : {},
+      recipient_count:
+        typeof obj["recipient_count"] === "number"
+          ? (obj["recipient_count"] as number)
+          : Number(obj["recipient_count"] ?? 0),
+    };
+  }, []);
+
+  const loadPage = useCallback(
+    async (opts: { reset: boolean }) => {
+      setErrorMsg(null);
+      setLoading(true);
+
+      try {
+        const nextPage = opts.reset ? 0 : page;
+        const from = nextPage * PAGE_SIZE;
+        const to = from + PAGE_SIZE - 1;
+
+        let q = supabase
+          .from("admin_notification_campaigns")
+          .select(
+            "id,created_at,created_by,mode,title,body,data,criteria,recipient_count"
+          )
+          .order("created_at", { ascending: false })
+          .range(from, to);
+
+        if (timeMinIso) q = q.gte("created_at", timeMinIso);
+        if (modeFilter !== "all") q = q.eq("mode", modeFilter);
+
+        const s = search.trim();
+        if (s) q = q.or(`title.ilike.%${s}%,body.ilike.%${s}%`);
+
+        const { data, error } = await q;
+        if (error) throw error;
+
+        const list = Array.isArray(data) ? data : [];
+        const normalized = list.map(normalizeCampaign);
+
+        if (opts.reset) {
+          setCampaigns(normalized);
+          setPage(1);
+        } else {
+          setCampaigns((prev) => {
+            const merged = [...prev, ...normalized];
+            // de-dupe by id (in case filters change quickly)
+            const map = new Map<string, CampaignRow>();
+            for (const c of merged) map.set(c.id, c);
+            return Array.from(map.values()).sort((a, b) =>
+              a.created_at < b.created_at ? 1 : -1
+            );
+          });
+          setPage((p) => p + 1);
+        }
+
+        setHasMore(normalized.length === PAGE_SIZE);
+
+        await fetchAggsFor(normalized.map((c) => c.id));
+
+        // keep selected in sync
+        setSelected((prev) => {
+          if (!prev) return null;
+          const inNew = normalized.find((x) => x.id === prev.id);
+          return inNew ?? prev;
+        });
+      } catch (e: unknown) {
+        setErrorMsg(
+          e instanceof Error ? e.message : "Failed to load campaigns."
+        );
+      } finally {
+        setLoading(false);
+      }
+    },
+    [
+      PAGE_SIZE,
+      fetchAggsFor,
+      modeFilter,
+      normalizeCampaign,
+      page,
+      search,
+      timeMinIso,
+    ]
+  );
+
+  // Reset pagination when filters change
   useEffect(() => {
-    load();
-  }, [load]);
+    setSelected(null);
+    setFailures([]);
+    setFailuresError(null);
+    setHasMore(true);
+    setPage(0);
+    void loadPage({ reset: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search, modeFilter, range]);
+
+  const refresh = useCallback(async () => {
+    setSelected(null);
+    setFailures([]);
+    setFailuresError(null);
+    setHasMore(true);
+    setPage(0);
+    await loadPage({ reset: true });
+  }, [loadPage]);
 
   const rows = useMemo(() => {
     return campaigns.map((c) => {
@@ -347,13 +459,196 @@ export default function CampaignsPage() {
       const pending = a?.pending ?? 0;
       const ok = a?.ok ?? 0;
       const failed = a?.failed ?? 0;
-
       return { c, total, pending, ok, failed };
     });
   }, [campaigns, aggs]);
 
+  const selectedAgg = useMemo(() => {
+    if (!selected) return null;
+    const a = aggs[selected.id];
+    return {
+      total: a?.total ?? selected.recipient_count ?? 0,
+      pending: a?.pending ?? 0,
+      ok: a?.ok ?? 0,
+      failed: a?.failed ?? 0,
+    };
+  }, [aggs, selected]);
+
+  const loadFailures = useCallback(async (campaignId: string) => {
+    setFailures([]);
+    setFailuresError(null);
+    setFailuresLoading(true);
+
+    try {
+      const { data, error } = await supabase
+        .from("admin_notification_deliveries")
+        .select(
+          "id,created_at,campaign_id,customer_id,expo_push_token,in_app_inserted,push_attempted,push_ok,push_provider,push_response,error"
+        )
+        .eq("campaign_id", campaignId)
+        .eq("push_attempted", true)
+        .eq("push_ok", false)
+        .order("created_at", { ascending: false })
+        .limit(50);
+
+      if (error) throw error;
+
+      const list = Array.isArray(data) ? (data as unknown[]) : [];
+      const normalized: DeliveryRow[] = list.map((r) => {
+        const obj = (r ?? {}) as Record<string, unknown>;
+        return {
+          id: safeString(obj["id"]),
+          created_at: safeString(obj["created_at"]),
+          campaign_id: safeString(obj["campaign_id"]),
+          customer_id: safeString(obj["customer_id"]),
+          expo_push_token: obj["expo_push_token"]
+            ? safeString(obj["expo_push_token"])
+            : null,
+          in_app_inserted: Boolean(obj["in_app_inserted"]),
+          push_attempted: Boolean(obj["push_attempted"]),
+          push_ok: Boolean(obj["push_ok"]),
+          push_provider: obj["push_provider"]
+            ? safeString(obj["push_provider"])
+            : null,
+          push_response: isObject(obj["push_response"])
+            ? (obj["push_response"] as Record<string, unknown>)
+            : null,
+          error: obj["error"] ? safeString(obj["error"]) : null,
+        };
+      });
+
+      setFailures(normalized);
+    } catch (e: unknown) {
+      setFailuresError(
+        e instanceof Error ? e.message : "Failed to load failures."
+      );
+    } finally {
+      setFailuresLoading(false);
+    }
+  }, []);
+
+  // When selecting a campaign, load failures if needed
+  useEffect(() => {
+    if (!selected) return;
+    const a = aggs[selected.id];
+    const failed = a?.failed ?? 0;
+    if (failed > 0 && showFailures) {
+      void loadFailures(selected.id);
+    } else {
+      setFailures([]);
+      setFailuresError(null);
+    }
+  }, [aggs, loadFailures, selected, showFailures]);
+
+  const handleCopyCampaignId = useCallback(async () => {
+    if (!selected) return;
+    const ok = await copyToClipboard(selected.id);
+    showToast(ok ? "Campaign ID copied" : "Copy failed");
+  }, [selected, showToast]);
+
+  const handleCopyCriteria = useCallback(async () => {
+    if (!selected) return;
+    const ok = await copyToClipboard(
+      JSON.stringify(selected.criteria ?? {}, null, 2)
+    );
+    showToast(ok ? "Criteria copied" : "Copy failed");
+  }, [selected, showToast]);
+
+  const handleCopyData = useCallback(async () => {
+    if (!selected) return;
+    const ok = await copyToClipboard(
+      JSON.stringify(selected.data ?? {}, null, 2)
+    );
+    showToast(ok ? "Data copied" : "Copy failed");
+  }, [selected, showToast]);
+
+  const exportDeliveriesCsv = useCallback(async () => {
+    if (!selected) return;
+
+    try {
+      setFailuresError(null);
+      setFailuresLoading(true);
+
+      // Fetch all deliveries for this campaign (cap at 5000 to protect browser)
+      const { data, error } = await supabase
+        .from("admin_notification_deliveries")
+        .select(
+          "id,created_at,campaign_id,customer_id,expo_push_token,in_app_inserted,push_attempted,push_ok,push_provider,error,push_response"
+        )
+        .eq("campaign_id", selected.id)
+        .order("created_at", { ascending: false })
+        .limit(5000);
+
+      if (error) throw error;
+
+      const list = Array.isArray(data) ? (data as unknown[]) : [];
+
+      const header = [
+        "id",
+        "created_at",
+        "campaign_id",
+        "customer_id",
+        "expo_push_token",
+        "in_app_inserted",
+        "push_attempted",
+        "push_ok",
+        "push_provider",
+        "error",
+        "push_response_json",
+      ];
+
+      const lines: string[] = [];
+      lines.push(header.join(","));
+
+      for (const r of list) {
+        const obj = (r ?? {}) as Record<string, unknown>;
+        const pushResp = isObject(obj["push_response"])
+          ? JSON.stringify(obj["push_response"])
+          : safeString(obj["push_response"]);
+        const row = [
+          safeString(obj["id"]),
+          safeString(obj["created_at"]),
+          safeString(obj["campaign_id"]),
+          safeString(obj["customer_id"]),
+          obj["expo_push_token"] ? safeString(obj["expo_push_token"]) : "",
+          String(Boolean(obj["in_app_inserted"])),
+          String(Boolean(obj["push_attempted"])),
+          String(Boolean(obj["push_ok"])),
+          obj["push_provider"] ? safeString(obj["push_provider"]) : "",
+          obj["error"] ? safeString(obj["error"]) : "",
+          pushResp || "",
+        ].map(csvEscape);
+
+        lines.push(row.join(","));
+      }
+
+      const csv = lines.join("\n");
+      downloadCsv(`snapwin-campaign-${selected.id}-deliveries.csv`, csv);
+      showToast("CSV exported");
+    } catch (e: unknown) {
+      setFailuresError(
+        e instanceof Error ? e.message : "Failed to export CSV."
+      );
+    } finally {
+      setFailuresLoading(false);
+    }
+  }, [selected, showToast]);
+
   return (
     <div className="space-y-6">
+      {toast ? (
+        <div
+          className="fixed top-4 right-4 z-50 rounded-xl border px-4 py-2 text-sm shadow"
+          style={{
+            backgroundColor: COLORS.cardBg,
+            borderColor: COLORS.cardBorder,
+            color: COLORS.textPrimary,
+          }}
+        >
+          {toast}
+        </div>
+      ) : null}
+
       <div className="flex items-start justify-between gap-4">
         <div>
           <h1
@@ -363,13 +658,14 @@ export default function CampaignsPage() {
             Campaigns
           </h1>
           <p className="text-sm mt-1" style={{ color: COLORS.textMuted }}>
-            Audit log of notification campaigns and their delivery status.
+            Human-friendly audit log of notification campaigns and delivery
+            status.
           </p>
         </div>
 
         <button
           type="button"
-          onClick={load}
+          onClick={refresh}
           className="rounded px-4 py-2 text-sm font-semibold"
           style={{
             backgroundColor: COLORS.primaryButtonBg,
@@ -498,8 +794,21 @@ export default function CampaignsPage() {
             >
               Campaigns ({rows.length})
             </div>
-            <div className="text-xs" style={{ color: COLORS.textMuted }}>
-              Click a row to view details
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void loadPage({ reset: true })}
+                className="rounded px-3 py-1.5 text-xs font-semibold border"
+                style={{
+                  borderColor: COLORS.cardBorder,
+                  backgroundColor: COLORS.screenBg,
+                  color: COLORS.textSecondary,
+                }}
+                disabled={loading}
+              >
+                {loading ? "Loading…" : "Reload list"}
+              </button>
             </div>
           </div>
 
@@ -517,7 +826,6 @@ export default function CampaignsPage() {
             >
               {rows.map(({ c, total, pending, ok, failed }) => {
                 const isActive = selected?.id === c.id;
-
                 return (
                   <button
                     key={c.id}
@@ -548,12 +856,14 @@ export default function CampaignsPage() {
                             {modeLabel(c.mode)}
                           </span>
                         </div>
+
                         <div
                           className="text-xs mt-1"
                           style={{ color: COLORS.textMuted }}
                         >
                           {summarizeCriteria(c.mode, c.criteria)}
                         </div>
+
                         <div
                           className="text-xs mt-2"
                           style={{ color: COLORS.textMuted }}
@@ -601,6 +911,36 @@ export default function CampaignsPage() {
               })}
             </div>
           )}
+
+          <div
+            className="px-4 py-4 border-t"
+            style={{ borderColor: COLORS.cardBorder }}
+          >
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs" style={{ color: COLORS.textMuted }}>
+                Showing {rows.length}{" "}
+                {rows.length === 1 ? "campaign" : "campaigns"}
+              </div>
+
+              <button
+                type="button"
+                onClick={() => void loadPage({ reset: false })}
+                disabled={loading || !hasMore}
+                className="rounded px-4 py-2 text-sm font-semibold"
+                style={{
+                  backgroundColor: COLORS.primaryButtonBg,
+                  color: COLORS.primaryButtonText,
+                  opacity: loading || !hasMore ? 0.55 : 1,
+                }}
+              >
+                {hasMore
+                  ? loading
+                    ? "Loading…"
+                    : "Load more"
+                  : "No more results"}
+              </button>
+            </div>
+          </div>
         </div>
 
         {/* Details */}
@@ -611,11 +951,45 @@ export default function CampaignsPage() {
             borderColor: COLORS.cardBorder,
           }}
         >
-          <div
-            className="text-sm font-semibold mb-3"
-            style={{ color: COLORS.textPrimary }}
-          >
-            Details
+          <div className="flex items-center justify-between gap-3 mb-3">
+            <div
+              className="text-sm font-semibold"
+              style={{ color: COLORS.textPrimary }}
+            >
+              Details
+            </div>
+
+            {selected ? (
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleCopyCampaignId}
+                  className="rounded px-3 py-1.5 text-xs font-semibold border"
+                  style={{
+                    borderColor: COLORS.cardBorder,
+                    backgroundColor: COLORS.screenBg,
+                    color: COLORS.textSecondary,
+                  }}
+                >
+                  Copy ID
+                </button>
+
+                <button
+                  type="button"
+                  onClick={exportDeliveriesCsv}
+                  className="rounded px-3 py-1.5 text-xs font-semibold border"
+                  style={{
+                    borderColor: COLORS.cardBorder,
+                    backgroundColor: COLORS.screenBg,
+                    color: COLORS.textSecondary,
+                    opacity: failuresLoading ? 0.7 : 1,
+                  }}
+                  disabled={failuresLoading}
+                >
+                  Export CSV
+                </button>
+              </div>
+            ) : null}
           </div>
 
           {!selected ? (
@@ -623,126 +997,268 @@ export default function CampaignsPage() {
               Select a campaign to view details.
             </div>
           ) : (
-            (() => {
-              const a = aggs[selected.id];
-              const total = a?.total ?? selected.recipient_count ?? 0;
-              const pending = a?.pending ?? 0;
-              const ok = a?.ok ?? 0;
-              const failed = a?.failed ?? 0;
-
-              return (
-                <div className="space-y-4">
-                  <div>
-                    <div
-                      className="text-lg font-bold"
-                      style={{ color: COLORS.textPrimary }}
-                    >
-                      {selected.title || "Untitled"}
-                    </div>
-                    <div
-                      className="text-xs mt-1"
-                      style={{ color: COLORS.textMuted }}
-                    >
-                      {modeLabel(selected.mode)} •{" "}
-                      {formatDate(selected.created_at)}
-                    </div>
-                  </div>
-
-                  <div className="space-y-1">
-                    <div
-                      className="text-xs font-semibold"
-                      style={{ color: COLORS.textMuted }}
-                    >
-                      Message
-                    </div>
-                    <div
-                      className="rounded-xl border p-3 text-sm"
-                      style={{
-                        borderColor: COLORS.cardBorder,
-                        backgroundColor: COLORS.screenBg,
-                        color: COLORS.textPrimary,
-                      }}
-                    >
-                      {selected.body || "—"}
-                    </div>
-                  </div>
-
-                  <div className="flex flex-wrap gap-2">
-                    <Chip label="Recipients" value={total} tone="neutral" />
-                    <Chip
-                      label="Pending"
-                      value={pending}
-                      tone={pending > 0 ? "warn" : "neutral"}
-                    />
-                    <Chip
-                      label="OK"
-                      value={ok}
-                      tone={ok > 0 ? "good" : "neutral"}
-                    />
-                    <Chip
-                      label="Failed"
-                      value={failed}
-                      tone={failed > 0 ? "bad" : "neutral"}
-                    />
-                  </div>
-
-                  <div className="space-y-2">
-                    <div
-                      className="text-xs font-semibold"
-                      style={{ color: COLORS.textMuted }}
-                    >
-                      Criteria summary
-                    </div>
-                    <div
-                      className="text-sm"
-                      style={{ color: COLORS.textPrimary }}
-                    >
-                      {summarizeCriteria(selected.mode, selected.criteria)}
-                    </div>
-                  </div>
-
-                  <div className="space-y-2">
-                    <div
-                      className="text-xs font-semibold"
-                      style={{ color: COLORS.textMuted }}
-                    >
-                      Raw criteria (JSON)
-                    </div>
-                    <pre
-                      className="text-xs rounded-xl border p-3 overflow-auto"
-                      style={{
-                        borderColor: COLORS.cardBorder,
-                        backgroundColor: COLORS.screenBg,
-                        color: COLORS.textSecondary,
-                        maxHeight: 240,
-                      }}
-                    >
-                      {JSON.stringify(selected.criteria ?? {}, null, 2)}
-                    </pre>
-                  </div>
-
-                  <div className="space-y-2">
-                    <div
-                      className="text-xs font-semibold"
-                      style={{ color: COLORS.textMuted }}
-                    >
-                      Data payload (JSON)
-                    </div>
-                    <pre
-                      className="text-xs rounded-xl border p-3 overflow-auto"
-                      style={{
-                        borderColor: COLORS.cardBorder,
-                        backgroundColor: COLORS.screenBg,
-                        color: COLORS.textSecondary,
-                        maxHeight: 240,
-                      }}
-                    >
-                      {JSON.stringify(selected.data ?? {}, null, 2)}
-                    </pre>
-                  </div>
+            <div className="space-y-4">
+              <div>
+                <div
+                  className="text-lg font-bold"
+                  style={{ color: COLORS.textPrimary }}
+                >
+                  {selected.title || "Untitled"}
                 </div>
-              );
-            })()
+                <div
+                  className="text-xs mt-1"
+                  style={{ color: COLORS.textMuted }}
+                >
+                  {modeLabel(selected.mode)} • {formatDate(selected.created_at)}
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <div
+                  className="text-xs font-semibold"
+                  style={{ color: COLORS.textMuted }}
+                >
+                  Message
+                </div>
+                <div
+                  className="rounded-xl border p-3 text-sm"
+                  style={{
+                    borderColor: COLORS.cardBorder,
+                    backgroundColor: COLORS.screenBg,
+                    color: COLORS.textPrimary,
+                  }}
+                >
+                  {selected.body || "—"}
+                </div>
+              </div>
+
+              {selectedAgg ? (
+                <div className="flex flex-wrap gap-2">
+                  <Chip
+                    label="Recipients"
+                    value={selectedAgg.total}
+                    tone="neutral"
+                  />
+                  <Chip
+                    label="Pending"
+                    value={selectedAgg.pending}
+                    tone={selectedAgg.pending > 0 ? "warn" : "neutral"}
+                  />
+                  <Chip
+                    label="OK"
+                    value={selectedAgg.ok}
+                    tone={selectedAgg.ok > 0 ? "good" : "neutral"}
+                  />
+                  <Chip
+                    label="Failed"
+                    value={selectedAgg.failed}
+                    tone={selectedAgg.failed > 0 ? "bad" : "neutral"}
+                  />
+                </div>
+              ) : null}
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div
+                    className="text-xs font-semibold"
+                    style={{ color: COLORS.textMuted }}
+                  >
+                    Criteria
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleCopyCriteria}
+                    className="text-xs underline"
+                    style={{ color: COLORS.textMuted }}
+                  >
+                    Copy JSON
+                  </button>
+                </div>
+
+                <div className="text-sm" style={{ color: COLORS.textPrimary }}>
+                  {summarizeCriteria(selected.mode, selected.criteria)}
+                </div>
+
+                <div
+                  className="rounded-xl border p-3 text-xs overflow-auto"
+                  style={{
+                    borderColor: COLORS.cardBorder,
+                    backgroundColor: COLORS.screenBg,
+                    color: COLORS.textSecondary,
+                    maxHeight: 160,
+                  }}
+                  title={JSON.stringify(selected.criteria ?? {}, null, 2)}
+                >
+                  {jsonPreview(selected.criteria, 600)}
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div
+                    className="text-xs font-semibold"
+                    style={{ color: COLORS.textMuted }}
+                  >
+                    Data payload
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleCopyData}
+                    className="text-xs underline"
+                    style={{ color: COLORS.textMuted }}
+                  >
+                    Copy JSON
+                  </button>
+                </div>
+
+                <div
+                  className="rounded-xl border p-3 text-xs overflow-auto"
+                  style={{
+                    borderColor: COLORS.cardBorder,
+                    backgroundColor: COLORS.screenBg,
+                    color: COLORS.textSecondary,
+                    maxHeight: 160,
+                  }}
+                  title={JSON.stringify(selected.data ?? {}, null, 2)}
+                >
+                  {jsonPreview(selected.data, 600)}
+                </div>
+              </div>
+
+              {/* Failures */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div
+                    className="text-xs font-semibold"
+                    style={{ color: COLORS.textMuted }}
+                  >
+                    Delivery failures
+                  </div>
+
+                  <label
+                    className="flex items-center gap-2 text-xs"
+                    style={{ color: COLORS.textMuted }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={showFailures}
+                      onChange={(e) => setShowFailures(e.target.checked)}
+                    />
+                    Show failures
+                  </label>
+                </div>
+
+                {!showFailures ? (
+                  <div className="text-sm" style={{ color: COLORS.textMuted }}>
+                    Failures hidden.
+                  </div>
+                ) : failuresLoading ? (
+                  <div className="text-sm" style={{ color: COLORS.textMuted }}>
+                    Loading failures…
+                  </div>
+                ) : failuresError ? (
+                  <div
+                    className="rounded px-3 py-2 text-sm border"
+                    style={{
+                      backgroundColor: "#FEF2F2",
+                      borderColor: "#FCA5A5",
+                      color: COLORS.error,
+                    }}
+                  >
+                    {failuresError}
+                  </div>
+                ) : failures.length === 0 ? (
+                  <div className="text-sm" style={{ color: COLORS.textMuted }}>
+                    No failures found (or failures not loaded yet).
+                  </div>
+                ) : (
+                  <div
+                    className="rounded-xl border overflow-hidden"
+                    style={{ borderColor: COLORS.cardBorder }}
+                  >
+                    <div
+                      className="px-3 py-2 text-xs border-b"
+                      style={{
+                        borderColor: COLORS.cardBorder,
+                        color: COLORS.textMuted,
+                        backgroundColor: COLORS.screenBg,
+                      }}
+                    >
+                      Showing latest {failures.length} failed deliveries (max
+                      50)
+                    </div>
+
+                    <div
+                      className="divide-y"
+                      style={{ borderColor: COLORS.cardBorder }}
+                    >
+                      {failures.map((f) => (
+                        <div key={f.id} className="px-3 py-2">
+                          <div className="flex items-start justify-between gap-2">
+                            <div
+                              className="text-xs"
+                              style={{ color: COLORS.textMuted }}
+                            >
+                              {formatDate(f.created_at)} • Customer:{" "}
+                              {formatShortId(f.customer_id)}
+                            </div>
+                            <div
+                              className="text-xs"
+                              style={{ color: COLORS.textMuted }}
+                            >
+                              {f.push_provider ?? "expo"}
+                            </div>
+                          </div>
+
+                          <div
+                            className="mt-1 text-sm"
+                            style={{ color: COLORS.textPrimary }}
+                          >
+                            {f.error
+                              ? f.error
+                              : "Push failed (no error message stored)"}
+                          </div>
+
+                          {f.push_response ? (
+                            <div
+                              className="mt-2 rounded-lg border p-2 text-xs overflow-auto"
+                              style={{
+                                borderColor: COLORS.cardBorder,
+                                backgroundColor: COLORS.screenBg,
+                                color: COLORS.textSecondary,
+                                maxHeight: 120,
+                              }}
+                            >
+                              {jsonPreview(f.push_response, 500)}
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Quick reload failures */}
+              {selectedAgg && selectedAgg.failed > 0 && showFailures ? (
+                <button
+                  type="button"
+                  onClick={() => void loadFailures(selected.id)}
+                  className="rounded px-4 py-2 text-sm font-semibold border"
+                  style={{
+                    borderColor: COLORS.cardBorder,
+                    backgroundColor: COLORS.screenBg,
+                    color: COLORS.textSecondary,
+                    opacity: failuresLoading ? 0.7 : 1,
+                  }}
+                  disabled={failuresLoading}
+                >
+                  {failuresLoading
+                    ? "Refreshing failures…"
+                    : "Refresh failures"}
+                </button>
+              ) : null}
+            </div>
           )}
         </div>
       </div>
