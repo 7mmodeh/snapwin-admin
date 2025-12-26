@@ -99,6 +99,13 @@ function timeAgo(iso: string) {
   return `${days}d ago`;
 }
 
+function clampText(s: string, max = 120) {
+  const x = (s ?? "").trim();
+  if (!x) return "—";
+  if (x.length <= max) return x;
+  return `${x.slice(0, max - 1)}…`;
+}
+
 function Chip({
   label,
   value,
@@ -106,7 +113,7 @@ function Chip({
 }: {
   label: string;
   value: string | number;
-  tone: "neutral" | "good" | "warn" | "bad";
+  tone: "neutral" | "good" | "warn" | "bad" | "info";
 }) {
   const styles = (() => {
     if (tone === "good") {
@@ -117,6 +124,9 @@ function Chip({
     }
     if (tone === "bad") {
       return { bg: "#FEF2F2", border: "#FCA5A5", text: "#991B1B" };
+    }
+    if (tone === "info") {
+      return { bg: "#EFF6FF", border: "#BFDBFE", text: "#1D4ED8" };
     }
     return {
       bg: COLORS.highlightCardBg,
@@ -150,6 +160,17 @@ function parseUuidArray(v: unknown): string[] {
   return [];
 }
 
+function onlyCompletedText(v: unknown) {
+  if (typeof v === "boolean")
+    return v ? "Completed tickets only" : "All tickets";
+  return "Completed tickets only";
+}
+
+function attemptText(v: unknown) {
+  if (typeof v === "boolean") return v ? "Passed" : "Failed";
+  return "Passed/Failed";
+}
+
 export default function CampaignsPage() {
   const router = useRouter();
 
@@ -168,6 +189,7 @@ export default function CampaignsPage() {
   const [search, setSearch] = useState("");
   const [modeFilter, setModeFilter] = useState<ModeKey | "all">("all");
   const [range, setRange] = useState<"today" | "7d" | "30d" | "all">("7d");
+  const [onlyFailures, setOnlyFailures] = useState(false);
 
   // Human-friendly resolvers
   const [raffleNameById, setRaffleNameById] = useState<Record<string, string>>(
@@ -209,48 +231,50 @@ export default function CampaignsPage() {
     };
   }, []);
 
-  const fetchAggsFor = useCallback(
-    async (campaignIds: string[]) => {
-      if (campaignIds.length === 0) return;
+  const fetchAggsFor = useCallback(async (campaignIds: string[]) => {
+    if (campaignIds.length === 0) return;
 
-      const { data, error } = await supabase
-        .from("admin_notification_deliveries")
-        .select("campaign_id,push_attempted,push_ok")
-        .in("campaign_id", campaignIds);
+    const { data, error } = await supabase
+      .from("admin_notification_deliveries")
+      .select("campaign_id,push_attempted,push_ok")
+      .in("campaign_id", campaignIds);
 
-      if (error) throw error;
+    if (error) throw error;
 
-      const rows = Array.isArray(data) ? (data as unknown[]) : [];
-      const next: Record<string, DeliveryAgg> = { ...aggs };
+    const rows = Array.isArray(data) ? (data as unknown[]) : [];
+    const next: Record<string, DeliveryAgg> = {};
 
-      for (const r of rows) {
-        const obj = (r ?? {}) as Record<string, unknown>;
-        const campaign_id = safeString(obj["campaign_id"]);
-        if (!campaign_id) continue;
+    // Rebuild aggs for just the fetched ids (prevents stale accumulation issues)
+    for (const id of campaignIds) {
+      next[id] = { campaign_id: id, total: 0, pending: 0, ok: 0, failed: 0 };
+    }
 
-        const push_attempted = Boolean(obj["push_attempted"]);
-        const push_ok = Boolean(obj["push_ok"]);
+    for (const r of rows) {
+      const obj = (r ?? {}) as Record<string, unknown>;
+      const campaign_id = safeString(obj["campaign_id"]);
+      if (!campaign_id) continue;
 
-        if (!next[campaign_id]) {
-          next[campaign_id] = {
-            campaign_id,
-            total: 0,
-            pending: 0,
-            ok: 0,
-            failed: 0,
-          };
-        }
+      const push_attempted = Boolean(obj["push_attempted"]);
+      const push_ok = Boolean(obj["push_ok"]);
 
-        next[campaign_id].total += 1;
-        if (!push_attempted) next[campaign_id].pending += 1;
-        else if (push_ok) next[campaign_id].ok += 1;
-        else next[campaign_id].failed += 1;
+      if (!next[campaign_id]) {
+        next[campaign_id] = {
+          campaign_id,
+          total: 0,
+          pending: 0,
+          ok: 0,
+          failed: 0,
+        };
       }
 
-      setAggs(next);
-    },
-    [aggs]
-  );
+      next[campaign_id].total += 1;
+      if (!push_attempted) next[campaign_id].pending += 1;
+      else if (push_ok) next[campaign_id].ok += 1;
+      else next[campaign_id].failed += 1;
+    }
+
+    setAggs((prev) => ({ ...prev, ...next }));
+  }, []);
 
   const resolveRaffleNames = useCallback(
     async (raffleIds: string[]) => {
@@ -280,71 +304,109 @@ export default function CampaignsPage() {
     [raffleNameById]
   );
 
-  const summarizeCriteriaHuman = useCallback(
-    (mode: string, criteria: Record<string, unknown>): string => {
-      const mk = toModeKey(mode);
+  const extractRaffleIdsFromCriteria = useCallback(
+    (criteria: Record<string, unknown>) => {
+      const ids: string[] = [];
+      const rid = safeString(criteria["raffle_id"]);
+      if (rid) ids.push(rid);
+      ids.push(...parseUuidArray(criteria["raffle_ids"]));
+      return ids.filter(Boolean);
+    },
+    []
+  );
 
-      const raffleId = safeString(criteria["raffle_id"]);
-      const raffleIds = parseUuidArray(criteria["raffle_ids"]);
-      const customerIds = parseUuidArray(criteria["customer_ids"]);
-      const attemptPassed = criteria["attempt_passed"];
-      const onlyCompleted = criteria["only_completed_tickets"];
+  const renderTargetChips = useCallback(
+    (c: CampaignRow) => {
+      const mk = toModeKey(c.mode);
+      const cr = c.criteria ?? {};
 
-      const onlyCompletedText =
-        typeof onlyCompleted === "boolean"
-          ? onlyCompleted
-            ? "Completed tickets only"
-            : "All tickets"
-          : "Completed tickets only";
+      const raffleId = safeString(cr["raffle_id"]);
+      const raffleIds = parseUuidArray(cr["raffle_ids"]);
+      const customerIds = parseUuidArray(cr["customer_ids"]);
+      const onlyCompleted = cr["only_completed_tickets"];
+      const attemptPassed = cr["attempt_passed"];
 
-      const raffleName = raffleId ? raffleNameById[raffleId] : null;
+      const chips: React.ReactNode[] = [];
 
-      if (mk === "all_users") return "Everyone";
+      chips.push(
+        <Chip key="mode" label="Target" value={modeLabel(c.mode)} tone="info" />
+      );
 
       if (mk === "raffle_users") {
-        const label = raffleName
-          ? raffleName
-          : raffleId
-          ? formatShortId(raffleId)
-          : "—";
-        return `Raffle: ${label} • ${onlyCompletedText}`;
+        const label =
+          raffleNameById[raffleId] ||
+          (raffleId ? formatShortId(raffleId) : "—");
+        chips.push(
+          <Chip key="raffle" label="Raffle" value={label} tone="neutral" />
+        );
+        chips.push(
+          <Chip
+            key="tickets"
+            label="Tickets"
+            value={onlyCompletedText(onlyCompleted)}
+            tone="neutral"
+          />
+        );
       }
 
       if (mk === "multi_raffle_union") {
         const names = raffleIds
           .map((id) => raffleNameById[id])
-          .filter(Boolean)
-          .slice(0, 3) as string[];
+          .filter(Boolean) as string[];
+        const shown = names.slice(0, 2);
+        const remainder = Math.max(raffleIds.length - shown.length, 0);
 
-        const remainder = Math.max(raffleIds.length - names.length, 0);
-        const nameText =
-          names.length > 0
-            ? `${names.join(", ")}${remainder ? ` +${remainder} more` : ""}`
-            : `${raffleIds.length || "—"} raffles`;
+        const v =
+          shown.length > 0
+            ? `${shown.join(", ")}${remainder ? ` +${remainder}` : ""}`
+            : `${raffleIds.length} raffles`;
 
-        return `Raffles: ${nameText} • ${onlyCompletedText}`;
+        chips.push(
+          <Chip key="raffles" label="Raffles" value={v} tone="neutral" />
+        );
+        chips.push(
+          <Chip
+            key="tickets"
+            label="Tickets"
+            value={onlyCompletedText(onlyCompleted)}
+            tone="neutral"
+          />
+        );
       }
 
       if (mk === "selected_customers") {
-        return `Selected customers: ${customerIds.length || "—"}`;
+        chips.push(
+          <Chip
+            key="selected"
+            label="Customers"
+            value={customerIds.length || "—"}
+            tone="neutral"
+          />
+        );
       }
 
       if (mk === "attempt_status") {
-        const passedText =
-          typeof attemptPassed === "boolean"
-            ? attemptPassed
-              ? "Passed"
-              : "Failed"
-            : "Passed/Failed";
-        const scope = raffleName
-          ? raffleName
-          : raffleId
-          ? formatShortId(raffleId)
-          : "All raffles";
-        return `${passedText} • Scope: ${scope}`;
+        const scope =
+          raffleNameById[raffleId] ||
+          (raffleId ? formatShortId(raffleId) : "All raffles");
+        chips.push(
+          <Chip
+            key="attempt"
+            label="Attempt"
+            value={attemptText(attemptPassed)}
+            tone="neutral"
+          />
+        );
+        chips.push(
+          <Chip key="scope" label="Scope" value={scope} tone="neutral" />
+        );
       }
 
-      return "—";
+      if (mk === "all_users") {
+        // No extra chips
+      }
+
+      return <div className="mt-2 flex flex-wrap gap-2">{chips}</div>;
     },
     [raffleNameById]
   );
@@ -379,14 +441,12 @@ export default function CampaignsPage() {
         const list = Array.isArray(data) ? data : [];
         const normalized = list.map(normalizeCampaign);
 
-        // Resolve raffle IDs found in criteria for more human display
+        // Resolve raffle IDs for human display
         const raffleIdsToResolve: string[] = [];
         for (const c of normalized) {
-          const cr = c.criteria ?? {};
-          const rid = safeString(cr["raffle_id"]);
-          if (rid) raffleIdsToResolve.push(rid);
-          const rids = parseUuidArray(cr["raffle_ids"]);
-          raffleIdsToResolve.push(...rids);
+          raffleIdsToResolve.push(
+            ...extractRaffleIdsFromCriteria(c.criteria ?? {})
+          );
         }
         const uniqRaffleIds = Array.from(
           new Set(raffleIdsToResolve.filter(Boolean))
@@ -420,6 +480,7 @@ export default function CampaignsPage() {
     },
     [
       PAGE_SIZE,
+      extractRaffleIdsFromCriteria,
       fetchAggsFor,
       modeFilter,
       normalizeCampaign,
@@ -445,7 +506,7 @@ export default function CampaignsPage() {
   }, [loadPage]);
 
   const rows = useMemo(() => {
-    return campaigns.map((c) => {
+    const computed = campaigns.map((c) => {
       const a = aggs[c.id];
       const total = a?.total ?? c.recipient_count ?? 0;
       const pending = a?.pending ?? 0;
@@ -453,7 +514,35 @@ export default function CampaignsPage() {
       const failed = a?.failed ?? 0;
       return { c, total, pending, ok, failed };
     });
-  }, [campaigns, aggs]);
+
+    if (!onlyFailures) return computed;
+
+    // If telemetry is not being updated, failed will be 0 and this will hide everything.
+    // We keep it as a "power filter" for the future, but it can currently lead to empty results.
+    return computed.filter((x) => x.failed > 0);
+  }, [campaigns, aggs, onlyFailures]);
+
+  const telemetryLooksDisabled = useMemo(() => {
+    // Heuristic: if we have rows with tokens but attempted=0 across all loaded campaigns
+    // then telemetry isn't being written by the Edge Function.
+    if (rows.length === 0) return false;
+
+    const anyWithRecipients = rows.some((r) => (r.total ?? 0) > 0);
+    if (!anyWithRecipients) return false;
+
+    const anyAttempted = rows.some(
+      (r) => r.ok > 0 || r.failed > 0 || r.pending < r.total
+    );
+    return !anyAttempted;
+  }, [rows]);
+
+  const copyToClipboard = useCallback(async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // No-op
+    }
+  }, []);
 
   return (
     <div className="space-y-6">
@@ -486,6 +575,22 @@ export default function CampaignsPage() {
         </button>
       </div>
 
+      {telemetryLooksDisabled && (
+        <div
+          className="rounded-2xl border px-4 py-3 text-sm"
+          style={{
+            backgroundColor: "#FFFBEB",
+            borderColor: "#FDE68A",
+            color: "#92400E",
+          }}
+        >
+          Push delivery telemetry is currently not updated in the database
+          (push_attempted/push_ok remain false). The campaigns are sending
+          successfully, but Pending/OK/Failed on this page should be treated as
+          informational only.
+        </div>
+      )}
+
       <div
         className="rounded-2xl border p-4 space-y-4"
         style={{
@@ -493,7 +598,7 @@ export default function CampaignsPage() {
           borderColor: COLORS.cardBorder,
         }}
       >
-        <div className="grid grid-cols-1 lg:grid-cols-4 gap-3">
+        <div className="grid grid-cols-1 lg:grid-cols-5 gap-3">
           <div className="lg:col-span-2">
             <label
               className="block text-xs font-semibold mb-1"
@@ -567,6 +672,20 @@ export default function CampaignsPage() {
               <option value="all">All time</option>
             </select>
           </div>
+
+          <div className="flex items-end">
+            <label
+              className="inline-flex items-center gap-2 text-sm w-full"
+              style={{ color: COLORS.textSecondary }}
+            >
+              <input
+                type="checkbox"
+                checked={onlyFailures}
+                onChange={(e) => setOnlyFailures(e.target.checked)}
+              />
+              Only failures
+            </label>
+          </div>
         </div>
 
         {errorMsg && (
@@ -624,6 +743,15 @@ export default function CampaignsPage() {
               style={{ color: COLORS.textMuted }}
             >
               No campaigns found for the current filters.
+              {onlyFailures && (
+                <div
+                  className="text-xs mt-2"
+                  style={{ color: COLORS.textMuted }}
+                >
+                  Note: “Only failures” requires push telemetry to be recorded
+                  in the DB.
+                </div>
+              )}
             </div>
           ) : (
             <div
@@ -632,20 +760,20 @@ export default function CampaignsPage() {
             >
               {rows.map(({ c, total, pending, ok, failed }) => {
                 return (
-                  <button
+                  <div
                     key={c.id}
-                    type="button"
-                    onClick={() =>
-                      router.push(`/notifications/campaigns/${c.id}`)
-                    }
-                    className="w-full text-left px-4 py-4 transition"
-                    style={{
-                      backgroundColor: COLORS.cardBg,
-                      color: COLORS.textPrimary,
-                    }}
+                    className="px-4 py-4"
+                    style={{ backgroundColor: COLORS.cardBg }}
                   >
                     <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          router.push(`/notifications/campaigns/${c.id}`)
+                        }
+                        className="text-left min-w-0 flex-1"
+                        style={{ color: COLORS.textPrimary }}
+                      >
                         <div className="flex items-center gap-2 flex-wrap">
                           <div className="font-semibold truncate">
                             {c.title || "Untitled"}
@@ -663,11 +791,13 @@ export default function CampaignsPage() {
                         </div>
 
                         <div
-                          className="text-xs mt-1"
-                          style={{ color: COLORS.textMuted }}
+                          className="text-sm mt-2"
+                          style={{ color: COLORS.textSecondary }}
                         >
-                          {summarizeCriteriaHuman(c.mode, c.criteria ?? {})}
+                          {clampText(c.body, 140)}
                         </div>
+
+                        {renderTargetChips(c)}
 
                         <div
                           className="text-xs mt-2"
@@ -676,20 +806,52 @@ export default function CampaignsPage() {
                           {timeAgo(c.created_at)} • {formatDate(c.created_at)} •
                           ID: {formatShortId(c.id)}
                         </div>
-                      </div>
+                      </button>
 
                       <div className="flex flex-col items-end gap-2 shrink-0">
-                        <div
-                          className="text-sm font-semibold"
-                          style={{ color: COLORS.textPrimary }}
-                        >
-                          {total}
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void copyToClipboard(c.id)}
+                            className="rounded px-3 py-1.5 text-xs font-semibold border"
+                            style={{
+                              borderColor: COLORS.cardBorder,
+                              backgroundColor: COLORS.screenBg,
+                              color: COLORS.textSecondary,
+                            }}
+                            title="Copy campaign ID"
+                          >
+                            Copy ID
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              router.push(`/notifications/campaigns/${c.id}`)
+                            }
+                            className="rounded px-3 py-1.5 text-xs font-semibold"
+                            style={{
+                              backgroundColor: COLORS.primaryButtonBg,
+                              color: COLORS.primaryButtonText,
+                            }}
+                            title="Open campaign audit"
+                          >
+                            Open
+                          </button>
                         </div>
-                        <div
-                          className="text-[0.7rem]"
-                          style={{ color: COLORS.textMuted }}
-                        >
-                          recipients
+
+                        <div className="text-right">
+                          <div
+                            className="text-sm font-semibold"
+                            style={{ color: COLORS.textPrimary }}
+                          >
+                            {total}
+                          </div>
+                          <div
+                            className="text-[0.7rem]"
+                            style={{ color: COLORS.textMuted }}
+                          >
+                            recipients
+                          </div>
                         </div>
                       </div>
                     </div>
@@ -711,7 +873,7 @@ export default function CampaignsPage() {
                         tone={failed > 0 ? "bad" : "neutral"}
                       />
                     </div>
-                  </button>
+                  </div>
                 );
               })}
             </div>
@@ -748,7 +910,7 @@ export default function CampaignsPage() {
           </div>
         </div>
 
-        {/* Right panel: instructions */}
+        {/* Right panel */}
         <div
           className="rounded-2xl border p-4 space-y-3"
           style={{
@@ -760,21 +922,27 @@ export default function CampaignsPage() {
             className="text-sm font-semibold"
             style={{ color: COLORS.textPrimary }}
           >
-            How to use
+            What you are seeing
           </div>
 
           <div className="text-sm" style={{ color: COLORS.textSecondary }}>
-            Click any campaign to open its audit view. There you can:
+            Each campaign is an immutable audit record of what was sent
+            (title/body/data + targeting criteria).
           </div>
 
           <ul
             className="list-disc pl-5 text-sm space-y-1"
             style={{ color: COLORS.textSecondary }}
           >
-            <li>See per-recipient delivery outcomes</li>
-            <li>Filter pending / OK / failed</li>
-            <li>Export deliveries to CSV</li>
-            <li>Copy campaign ID for support/debugging</li>
+            <li>
+              “Recipients” is the count of delivery rows created for the
+              campaign.
+            </li>
+            <li>
+              Pending/OK/Failed will become authoritative once push telemetry is
+              written back.
+            </li>
+            <li>Use “Copy ID” when debugging a specific send.</li>
           </ul>
 
           <div
@@ -785,8 +953,7 @@ export default function CampaignsPage() {
               color: COLORS.textMuted,
             }}
           >
-            Tip: Use “Search” + “Mode” + “Time range” to find a specific send
-            quickly.
+            Tip: Use Mode + Time range first, then Search to narrow quickly.
           </div>
         </div>
       </div>

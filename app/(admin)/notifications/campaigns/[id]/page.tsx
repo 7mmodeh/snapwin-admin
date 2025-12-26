@@ -100,6 +100,21 @@ function formatDate(v: string) {
   return d.toLocaleString("en-IE");
 }
 
+function timeAgo(iso: string) {
+  const d = new Date(iso);
+  const t = d.getTime();
+  if (Number.isNaN(t)) return "—";
+  const diffMs = Date.now() - t;
+  const s = Math.floor(diffMs / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const days = Math.floor(h / 24);
+  return `${days}d ago`;
+}
+
 function parseUuidArray(v: unknown): string[] {
   if (Array.isArray(v)) return v.map((x) => safeString(x)).filter(Boolean);
   if (typeof v === "string")
@@ -146,9 +161,14 @@ function jsonPreview(
   return s.length > max ? `${s.slice(0, max)}…` : s;
 }
 
+function clampText(s: string, max = 160) {
+  const x = (s ?? "").trim();
+  if (!x) return "—";
+  if (x.length <= max) return x;
+  return `${x.slice(0, max - 1)}…`;
+}
+
 function inferPushAttempted(d: DeliveryRow): boolean {
-  // DB-truth: push_attempted, but if your edge function didn't write back,
-  // we still consider it attempted when there is response or error.
   if (d.push_attempted) return true;
   if (d.error) return true;
   if (d.push_response && Object.keys(d.push_response).length > 0) return true;
@@ -156,14 +176,10 @@ function inferPushAttempted(d: DeliveryRow): boolean {
 }
 
 function inferPushOk(d: DeliveryRow): boolean | null {
-  // If DB says attempted, trust DB's push_ok.
   if (d.push_attempted) return d.push_ok;
 
-  // If DB did not mark attempted but we have an error -> failed.
   if (d.error) return false;
 
-  // If we have response, attempt to infer "ok" from common shapes.
-  // We do NOT assume the exact response schema—only do light checks.
   if (d.push_response) {
     const pr = d.push_response;
     const status = safeString(pr["status"]).toLowerCase();
@@ -173,12 +189,43 @@ function inferPushOk(d: DeliveryRow): boolean | null {
     const ok = pr["ok"];
     if (typeof ok === "boolean") return ok;
 
-    // Unknown: attempted but cannot infer outcome.
     return null;
   }
 
-  // Truly pending.
   return null;
+}
+
+function Pill({
+  text,
+  tone,
+}: {
+  text: string;
+  tone: "neutral" | "good" | "warn" | "bad" | "info";
+}) {
+  const styles = (() => {
+    if (tone === "good") return { bg: "#ECFDF5", bd: "#6EE7B7", tx: "#065F46" };
+    if (tone === "warn") return { bg: "#FFFBEB", bd: "#FDE68A", tx: "#92400E" };
+    if (tone === "bad") return { bg: "#FEF2F2", bd: "#FCA5A5", tx: "#991B1B" };
+    if (tone === "info") return { bg: "#EFF6FF", bd: "#BFDBFE", tx: "#1D4ED8" };
+    return {
+      bg: COLORS.screenBg,
+      bd: COLORS.cardBorder,
+      tx: COLORS.textSecondary,
+    };
+  })();
+
+  return (
+    <span
+      className="inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold"
+      style={{
+        backgroundColor: styles.bg,
+        borderColor: styles.bd,
+        color: styles.tx,
+      }}
+    >
+      {text}
+    </span>
+  );
 }
 
 export default function CampaignDetailPage() {
@@ -457,7 +504,6 @@ export default function CampaignDetailPage() {
 
         setHasMore(normalized.length === PAGE_SIZE);
 
-        // Resolve customer labels for the currently loaded page
         await resolveCustomers(normalized.map((d) => d.customer_id));
       } catch (e: unknown) {
         setDeliveriesError(
@@ -470,12 +516,10 @@ export default function CampaignDetailPage() {
     [PAGE_SIZE, campaignId, page, resolveCustomers, status]
   );
 
-  // initial load
   useEffect(() => {
     void loadCampaign();
   }, [loadCampaign]);
 
-  // reset deliveries on status change
   useEffect(() => {
     setDeliveries([]);
     setHasMore(true);
@@ -546,18 +590,122 @@ export default function CampaignDetailPage() {
   }, [campaign, summarizeCriteriaHuman]);
 
   const statusLabel = useMemo(() => {
-    if (status === "pending") return "Pending";
-    if (status === "ok") return "OK";
-    if (status === "failed") return "Failed";
+    if (status === "pending") return "Pending (DB)";
+    if (status === "ok") return "OK (DB)";
+    if (status === "failed") return "Failed (DB)";
     return "All";
   }, [status]);
 
   const telemetryLooksUnwritten = useMemo(() => {
-    // If you have deliveries but all show push_attempted=false, it usually means
-    // the sender did not update DB after sending.
     if (deliveries.length === 0) return false;
     const attempted = deliveries.some((d) => d.push_attempted);
     return !attempted;
+  }, [deliveries]);
+
+  const criteriaChips = useMemo(() => {
+    if (!campaign) return [];
+
+    const mk = toModeKey(campaign.mode);
+    const cr = campaign.criteria ?? {};
+
+    const raffleId = safeString(cr["raffle_id"]);
+    const raffleIds = parseUuidArray(cr["raffle_ids"]);
+    const customerIds = parseUuidArray(cr["customer_ids"]);
+    const attemptPassed = cr["attempt_passed"];
+    const onlyCompleted = cr["only_completed_tickets"];
+
+    const chips: Array<{ text: string; tone: "neutral" | "info" }> = [];
+    chips.push({ text: `Mode: ${modeLabel(campaign.mode)}`, tone: "info" });
+
+    const ticketsText =
+      typeof onlyCompleted === "boolean"
+        ? onlyCompleted
+          ? "Completed tickets only"
+          : "All tickets"
+        : "Completed tickets only";
+
+    if (mk === "raffle_users") {
+      const label =
+        raffleNameById[raffleId] || (raffleId ? formatShortId(raffleId) : "—");
+      chips.push({ text: `Raffle: ${label}`, tone: "neutral" });
+      chips.push({ text: ticketsText, tone: "neutral" });
+    }
+
+    if (mk === "multi_raffle_union") {
+      const names = raffleIds
+        .map((id) => raffleNameById[id])
+        .filter(Boolean) as string[];
+      const shown = names.slice(0, 2);
+      const remainder = Math.max(raffleIds.length - shown.length, 0);
+      const v =
+        shown.length > 0
+          ? `${shown.join(", ")}${remainder ? ` +${remainder}` : ""}`
+          : `${raffleIds.length} raffles`;
+      chips.push({ text: `Raffles: ${v}`, tone: "neutral" });
+      chips.push({ text: ticketsText, tone: "neutral" });
+    }
+
+    if (mk === "selected_customers") {
+      chips.push({
+        text: `Selected customers: ${customerIds.length || "—"}`,
+        tone: "neutral",
+      });
+    }
+
+    if (mk === "attempt_status") {
+      const passedText =
+        typeof attemptPassed === "boolean"
+          ? attemptPassed
+            ? "Passed"
+            : "Failed"
+          : "Passed/Failed";
+      const scope =
+        raffleNameById[raffleId] ||
+        (raffleId ? formatShortId(raffleId) : "All raffles");
+      chips.push({ text: `Attempt: ${passedText}`, tone: "neutral" });
+      chips.push({ text: `Scope: ${scope}`, tone: "neutral" });
+    }
+
+    if (mk === "all_users") {
+      chips.push({ text: "Everyone", tone: "neutral" });
+    }
+
+    return chips;
+  }, [campaign, raffleNameById]);
+
+  const deliveryStats = useMemo(() => {
+    // Use inferred status for human-friendly header stats (does not change DB)
+    const total = deliveries.length;
+    let inferredPending = 0;
+    let inferredOk = 0;
+    let inferredFailed = 0;
+    let inferredAttemptedUnknown = 0;
+
+    let withToken = 0;
+    let inAppYes = 0;
+
+    for (const d of deliveries) {
+      if (d.expo_push_token) withToken += 1;
+      if (d.in_app_inserted) inAppYes += 1;
+
+      const attempted = inferPushAttempted(d);
+      const ok = inferPushOk(d);
+
+      if (!attempted) inferredPending += 1;
+      else if (ok === true) inferredOk += 1;
+      else if (ok === false) inferredFailed += 1;
+      else inferredAttemptedUnknown += 1;
+    }
+
+    return {
+      total,
+      withToken,
+      inAppYes,
+      inferredPending,
+      inferredOk,
+      inferredFailed,
+      inferredAttemptedUnknown,
+    };
   }, [deliveries]);
 
   if (loading) {
@@ -612,65 +760,106 @@ export default function CampaignDetailPage() {
         </div>
       ) : null}
 
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <button
-            type="button"
-            onClick={() => router.push("/notifications/campaigns")}
-            className="text-sm underline"
-            style={{ color: COLORS.textMuted }}
-          >
-            ← Back to campaigns
-          </button>
+      {/* Header */}
+      <div className="space-y-3">
+        <button
+          type="button"
+          onClick={() => router.push("/notifications/campaigns")}
+          className="text-sm underline"
+          style={{ color: COLORS.textMuted }}
+        >
+          ← Back to campaigns
+        </button>
 
-          <h1
-            className="text-2xl font-bold mt-2"
-            style={{ color: COLORS.textPrimary }}
-          >
-            {campaign.title || "Untitled"}
-          </h1>
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h1
+              className="text-2xl font-bold truncate"
+              style={{ color: COLORS.textPrimary }}
+            >
+              {campaign.title || "Untitled"}
+            </h1>
 
-          <div className="text-sm mt-1" style={{ color: COLORS.textMuted }}>
-            {modeLabel(campaign.mode)} • {formatDate(campaign.created_at)} • ID:{" "}
-            {formatShortId(campaign.id)}
+            <div className="text-sm mt-1" style={{ color: COLORS.textMuted }}>
+              {modeLabel(campaign.mode)} • {timeAgo(campaign.created_at)} •{" "}
+              {formatDate(campaign.created_at)}
+            </div>
+
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Pill
+                text={`Campaign: ${formatShortId(campaign.id)}`}
+                tone="neutral"
+              />
+              <Pill
+                text={`Recipients: ${campaign.recipient_count}`}
+                tone="info"
+              />
+              <Pill
+                text={`Loaded deliveries: ${deliveries.length}`}
+                tone="neutral"
+              />
+              <Pill text={criteriaSummary} tone="neutral" />
+            </div>
+
+            <div className="mt-3 flex flex-wrap gap-2">
+              {criteriaChips.map((c, idx) => (
+                <Pill
+                  key={idx}
+                  text={c.text}
+                  tone={c.tone === "info" ? "info" : "neutral"}
+                />
+              ))}
+            </div>
           </div>
 
-          <div className="text-sm mt-2" style={{ color: COLORS.textSecondary }}>
-            {criteriaSummary}
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={copyId}
+              className="rounded px-4 py-2 text-sm font-semibold border"
+              style={{
+                borderColor: COLORS.cardBorder,
+                backgroundColor: COLORS.screenBg,
+                color: COLORS.textSecondary,
+              }}
+            >
+              Copy ID
+            </button>
+
+            <button
+              type="button"
+              onClick={exportCurrentPageCsv}
+              className="rounded px-4 py-2 text-sm font-semibold"
+              style={{
+                backgroundColor: COLORS.primaryButtonBg,
+                color: COLORS.primaryButtonText,
+              }}
+            >
+              Export CSV (page)
+            </button>
           </div>
-        </div>
-
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={copyId}
-            className="rounded px-4 py-2 text-sm font-semibold border"
-            style={{
-              borderColor: COLORS.cardBorder,
-              backgroundColor: COLORS.screenBg,
-              color: COLORS.textSecondary,
-            }}
-          >
-            Copy ID
-          </button>
-
-          <button
-            type="button"
-            onClick={exportCurrentPageCsv}
-            className="rounded px-4 py-2 text-sm font-semibold"
-            style={{
-              backgroundColor: COLORS.primaryButtonBg,
-              color: COLORS.primaryButtonText,
-            }}
-          >
-            Export CSV (page)
-          </button>
         </div>
       </div>
 
+      {/* Telemetry note */}
+      {telemetryLooksUnwritten ? (
+        <div
+          className="rounded-2xl border px-4 py-3 text-sm"
+          style={{
+            backgroundColor: "#FFFBEB",
+            borderColor: "#FDE68A",
+            color: "#92400E",
+          }}
+        >
+          DB telemetry is not being written (push_attempted/push_ok remain
+          false). Push can still be working. This page shows an{" "}
+          <b>inferred push status</b> where possible (based on response/error).
+        </div>
+      ) : null}
+
       {/* Message preview */}
       <div
-        className="rounded-2xl border p-4"
+        className="rounded-2xl border p-4 space-y-3"
         style={{
           borderColor: COLORS.cardBorder,
           backgroundColor: COLORS.cardBg,
@@ -680,26 +869,29 @@ export default function CampaignDetailPage() {
           className="text-xs font-semibold"
           style={{ color: COLORS.textMuted }}
         >
-          Message preview
-        </div>
-        <div
-          className="text-sm font-semibold mt-1"
-          style={{ color: COLORS.textPrimary }}
-        >
-          {campaign.title || "SnapWin"}
-        </div>
-        <div className="text-sm mt-1" style={{ color: COLORS.textSecondary }}>
-          {campaign.body || "—"}
+          Message
         </div>
 
-        <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div className="space-y-1">
+          <div
+            className="text-sm font-semibold"
+            style={{ color: COLORS.textPrimary }}
+          >
+            {campaign.title || "SnapWin"}
+          </div>
+          <div className="text-sm" style={{ color: COLORS.textSecondary }}>
+            {campaign.body || "—"}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <div
             className="rounded-xl border p-3 text-xs overflow-auto"
             style={{
               borderColor: COLORS.cardBorder,
               backgroundColor: COLORS.screenBg,
               color: COLORS.textSecondary,
-              maxHeight: 180,
+              maxHeight: 220,
             }}
           >
             <div
@@ -708,7 +900,9 @@ export default function CampaignDetailPage() {
             >
               criteria (JSON)
             </div>
-            {jsonPreview(campaign.criteria, 900)}
+            <pre className="whitespace-pre-wrap">
+              {jsonPreview(campaign.criteria, 1400)}
+            </pre>
           </div>
 
           <div
@@ -717,7 +911,7 @@ export default function CampaignDetailPage() {
               borderColor: COLORS.cardBorder,
               backgroundColor: COLORS.screenBg,
               color: COLORS.textSecondary,
-              maxHeight: 180,
+              maxHeight: 220,
             }}
           >
             <div
@@ -726,7 +920,9 @@ export default function CampaignDetailPage() {
             >
               data payload (JSON)
             </div>
-            {jsonPreview(campaign.data, 900)}
+            <pre className="whitespace-pre-wrap">
+              {jsonPreview(campaign.data, 1400)}
+            </pre>
           </div>
         </div>
       </div>
@@ -740,7 +936,7 @@ export default function CampaignDetailPage() {
         }}
       >
         <div
-          className="px-4 py-3 border-b flex items-center justify-between gap-3"
+          className="px-4 py-3 border-b flex items-start justify-between gap-3"
           style={{ borderColor: COLORS.cardBorder }}
         >
           <div>
@@ -750,8 +946,35 @@ export default function CampaignDetailPage() {
             >
               Deliveries
             </div>
-            <div className="text-xs" style={{ color: COLORS.textMuted }}>
-              Filter: {statusLabel} • Showing {deliveries.length} rows
+
+            <div className="text-xs mt-1" style={{ color: COLORS.textMuted }}>
+              Filter: {statusLabel} • Loaded: {deliveries.length}
+            </div>
+
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Pill
+                text={`Tokens: ${deliveryStats.withToken}/${deliveryStats.total}`}
+                tone="neutral"
+              />
+              <Pill
+                text={`In-app: ${deliveryStats.inAppYes}/${deliveryStats.total}`}
+                tone="neutral"
+              />
+              <Pill text={`Push OK: ${deliveryStats.inferredOk}`} tone="good" />
+              <Pill
+                text={`Push Failed: ${deliveryStats.inferredFailed}`}
+                tone="bad"
+              />
+              <Pill
+                text={`Push Pending: ${deliveryStats.inferredPending}`}
+                tone="warn"
+              />
+              {deliveryStats.inferredAttemptedUnknown > 0 ? (
+                <Pill
+                  text={`Attempted (unknown): ${deliveryStats.inferredAttemptedUnknown}`}
+                  tone="info"
+                />
+              ) : null}
             </div>
           </div>
 
@@ -789,22 +1012,6 @@ export default function CampaignDetailPage() {
           </div>
         </div>
 
-        {telemetryLooksUnwritten ? (
-          <div
-            className="px-4 py-3 text-xs border-b"
-            style={{
-              backgroundColor: "#FFFBEB",
-              borderColor: "#FDE68A",
-              color: "#92400E",
-            }}
-          >
-            Note: DB telemetry shows <b>push_attempted=false</b> for these rows.
-            Push delivery is still displayed using an inferred status when there
-            is a response/error, but the canonical fix is to update delivery
-            rows from the Edge Function after sending.
-          </div>
-        ) : null}
-
         {deliveriesError ? (
           <div
             className="px-4 py-3 text-sm border-t"
@@ -834,7 +1041,7 @@ export default function CampaignDetailPage() {
           </div>
         ) : (
           <div className="overflow-auto">
-            <table className="min-w-[1120px] w-full text-sm">
+            <table className="min-w-[1200px] w-full text-sm">
               <thead>
                 <tr style={{ backgroundColor: COLORS.screenBg }}>
                   <th
@@ -853,13 +1060,7 @@ export default function CampaignDetailPage() {
                     className="text-left px-4 py-2"
                     style={{ color: COLORS.textMuted }}
                   >
-                    Push
-                  </th>
-                  <th
-                    className="text-left px-4 py-2"
-                    style={{ color: COLORS.textMuted }}
-                  >
-                    In-app
+                    Push status
                   </th>
                   <th
                     className="text-left px-4 py-2"
@@ -871,7 +1072,13 @@ export default function CampaignDetailPage() {
                     className="text-left px-4 py-2"
                     style={{ color: COLORS.textMuted }}
                   >
-                    Error / Response
+                    In-app
+                  </th>
+                  <th
+                    className="text-left px-4 py-2"
+                    style={{ color: COLORS.textMuted }}
+                  >
+                    Details
                   </th>
                 </tr>
               </thead>
@@ -879,6 +1086,7 @@ export default function CampaignDetailPage() {
               <tbody>
                 {deliveries.map((d) => {
                   const cm = customerById[d.customer_id];
+
                   const attempted = inferPushAttempted(d);
                   const ok = inferPushOk(d);
 
@@ -890,24 +1098,43 @@ export default function CampaignDetailPage() {
                     ? "FAILED"
                     : "ATTEMPTED";
 
+                  const isInferred = !d.push_attempted && attempted;
+
+                  const tone: "neutral" | "good" | "warn" | "bad" =
+                    pushState === "OK"
+                      ? "good"
+                      : pushState === "FAILED"
+                      ? "bad"
+                      : pushState === "PENDING"
+                      ? "warn"
+                      : "neutral";
+
                   return (
                     <tr
                       key={d.id}
-                      className="border-t"
+                      className="border-t align-top"
                       style={{ borderColor: COLORS.cardBorder }}
                     >
                       <td
-                        className="px-4 py-2"
+                        className="px-4 py-3"
                         style={{ color: COLORS.textSecondary }}
                       >
-                        {formatDate(d.created_at)}
+                        <div className="text-sm">
+                          {formatDate(d.created_at)}
+                        </div>
+                        <div
+                          className="text-xs"
+                          style={{ color: COLORS.textMuted }}
+                        >
+                          {timeAgo(d.created_at)}
+                        </div>
                       </td>
 
                       <td
-                        className="px-4 py-2"
+                        className="px-4 py-3"
                         style={{ color: COLORS.textPrimary }}
                       >
-                        <div className="font-medium">
+                        <div className="font-semibold">
                           {cm?.name ? cm.name : formatShortId(d.customer_id)}
                         </div>
                         <div
@@ -918,46 +1145,115 @@ export default function CampaignDetailPage() {
                             ? cm.email
                             : `ID: ${formatShortId(d.customer_id)}`}
                         </div>
-                      </td>
-
-                      <td
-                        className="px-4 py-2"
-                        style={{ color: COLORS.textPrimary }}
-                      >
-                        {pushState}
                         <div
-                          className="text-xs"
+                          className="text-xs mt-1"
                           style={{ color: COLORS.textMuted }}
                         >
-                          {d.push_provider ?? "expo"}
-                          {!d.push_attempted && attempted ? " (inferred)" : ""}
+                          Delivery: {formatShortId(d.id)}
                         </div>
                       </td>
 
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <Pill
+                            text={`${pushState}${
+                              isInferred ? " (inferred)" : " (DB)"
+                            }`}
+                            tone={
+                              tone === "good"
+                                ? "good"
+                                : tone === "bad"
+                                ? "bad"
+                                : tone === "warn"
+                                ? "warn"
+                                : "neutral"
+                            }
+                          />
+                          <Pill
+                            text={d.push_provider ?? "expo"}
+                            tone="neutral"
+                          />
+                        </div>
+
+                        {d.error ? (
+                          <div
+                            className="text-xs mt-2"
+                            style={{ color: COLORS.error }}
+                          >
+                            {clampText(d.error, 180)}
+                          </div>
+                        ) : null}
+                      </td>
+
                       <td
-                        className="px-4 py-2"
+                        className="px-4 py-3"
                         style={{ color: COLORS.textPrimary }}
                       >
-                        {d.in_app_inserted ? "Yes" : "No"}
+                        {d.expo_push_token ? (
+                          <Pill text="Has token" tone="good" />
+                        ) : (
+                          <Pill text="No token" tone="warn" />
+                        )}
                       </td>
 
                       <td
-                        className="px-4 py-2"
-                        style={{ color: COLORS.textSecondary }}
+                        className="px-4 py-3"
+                        style={{ color: COLORS.textPrimary }}
                       >
-                        {d.expo_push_token ? "Yes" : "No"}
+                        {d.in_app_inserted ? (
+                          <Pill text="Inserted" tone="good" />
+                        ) : (
+                          <Pill text="Not inserted" tone="neutral" />
+                        )}
                       </td>
 
                       <td
-                        className="px-4 py-2"
+                        className="px-4 py-3"
                         style={{ color: COLORS.textSecondary }}
                       >
-                        {d.error ? (
-                          <div style={{ color: COLORS.error }}>{d.error}</div>
-                        ) : d.push_response ? (
-                          <div className="text-xs">
-                            {jsonPreview(d.push_response, 240)}
-                          </div>
+                        {d.push_response || d.error ? (
+                          <details className="text-xs">
+                            <summary
+                              className="cursor-pointer select-none"
+                              style={{ color: COLORS.textSecondary }}
+                            >
+                              View response
+                            </summary>
+                            <div
+                              className="mt-2 rounded-xl border p-3 overflow-auto"
+                              style={{
+                                borderColor: COLORS.cardBorder,
+                                backgroundColor: COLORS.screenBg,
+                                color: COLORS.textSecondary,
+                                maxHeight: 220,
+                              }}
+                            >
+                              {d.error ? (
+                                <div style={{ color: COLORS.error }}>
+                                  <div className="font-semibold mb-1">
+                                    error
+                                  </div>
+                                  <pre className="whitespace-pre-wrap">
+                                    {d.error}
+                                  </pre>
+                                </div>
+                              ) : null}
+
+                              {d.push_response ? (
+                                <>
+                                  <div
+                                    className="font-semibold mt-2 mb-1"
+                                    style={{ color: COLORS.textMuted }}
+                                  >
+                                    push_response (JSON)
+                                  </div>
+                                  <pre className="whitespace-pre-wrap">
+                                    {jsonPreview(d.push_response, 1800)}
+                                  </pre>
+                                </>
+                              ) : null}
+                            </div>
+                          </details>
                         ) : (
                           "—"
                         )}
@@ -975,7 +1271,8 @@ export default function CampaignDetailPage() {
           style={{ borderColor: COLORS.cardBorder }}
         >
           <div className="text-xs" style={{ color: COLORS.textMuted }}>
-            Campaign recipients (stored): {campaign.recipient_count}
+            Stored recipients: {campaign.recipient_count} • Loaded deliveries:{" "}
+            {deliveries.length}
           </div>
 
           <button
