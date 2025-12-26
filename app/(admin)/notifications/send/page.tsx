@@ -1,17 +1,18 @@
-// app/(admin)/notifications/send/page.tsx
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
-import { adminSendNotificationCampaign } from "@/lib/adminNotifications";
-
-await adminSendNotificationCampaign({
-  mode: "all_users",
-  title: "Test",
-  body: "Hello",
-  data: { source: "admin-dashboard" },
-});
+import {
+  adminSendNotificationCampaign,
+  type AdminSendCampaignPayload,
+} from "@/lib/adminNotifications";
 
 type Mode =
   | "all_users"
@@ -75,7 +76,6 @@ function SearchSelect({
   emptyHint: string;
   renderRow?: never;
 }) {
-  // This is a lightweight wrapper for consistent styling.
   return (
     <div className="space-y-2">
       <label
@@ -219,7 +219,6 @@ export default function AdminSendNotificationPage() {
   }, [loadCustomers]);
 
   const loadRaffles = useCallback(async () => {
-    // Only load when a raffle is relevant to the current mode, to reduce noise.
     const raffleRelevant = mode === "raffle_users" || mode === "attempt_status";
     if (!raffleRelevant) {
       setRaffles([]);
@@ -231,7 +230,6 @@ export default function AdminSendNotificationPage() {
 
     setRafflesLoading(true);
     try {
-      // “current raffles” for admin selection: active + soldout by default
       let query = supabase
         .from("raffles")
         .select("id,item_name,status,draw_date")
@@ -257,9 +255,7 @@ export default function AdminSendNotificationPage() {
           })
         : [];
 
-      setRaffles(
-        normalized.filter((x) => x.id && x.item_name) // basic guard
-      );
+      setRaffles(normalized.filter((x) => x.id && x.item_name));
     } catch (e: unknown) {
       setRaffles([]);
       setErrorMsg(e instanceof Error ? e.message : "Failed to load raffles.");
@@ -366,17 +362,15 @@ export default function AdminSendNotificationPage() {
       return;
     }
 
+    // Parse JSON as a real object (no any)
     let parsedData: Record<string, unknown> = {};
     try {
-      parsedData = dataJson.trim() ? JSON.parse(dataJson) : {};
-      if (
-        parsedData == null ||
-        typeof parsedData !== "object" ||
-        Array.isArray(parsedData)
-      ) {
+      const raw: unknown = dataJson.trim() ? JSON.parse(dataJson) : {};
+      if (raw == null || typeof raw !== "object" || Array.isArray(raw)) {
         setErrorMsg('data JSON must be an object (e.g. {"source":"admin"}).');
         return;
       }
+      parsedData = raw as Record<string, unknown>;
     } catch {
       setErrorMsg("data JSON is invalid.");
       return;
@@ -384,8 +378,8 @@ export default function AdminSendNotificationPage() {
 
     setLoading(true);
     try {
-      // Build payload to match the Edge Function contract
-      const payload: Record<string, unknown> = {
+      // ✅ Strongly typed payload (no any)
+      const payload: AdminSendCampaignPayload = {
         mode,
         title: title.trim() || "SnapWin",
         body: body.trim(),
@@ -398,7 +392,6 @@ export default function AdminSendNotificationPage() {
       }
 
       if (mode === "attempt_status") {
-        // raffle_id optional: blank = all raffles
         const rid = raffleId.trim();
         if (rid) payload.raffle_id = rid;
         payload.attempt_passed = attemptPassed === "passed";
@@ -412,23 +405,13 @@ export default function AdminSendNotificationPage() {
         payload.customer_ids = effectiveSelectedCustomerIds;
       }
 
-      const { data, error } = await supabase.functions.invoke(
-        "admin-send-notification",
-        {
-          body: payload,
-          headers: {
-            "x-admin-secret":
-              process.env.NEXT_PUBLIC_ADMIN_FUNCTION_SECRET || "",
-          },
-        }
-      );
-
-      if (error) throw error;
+      // ✅ Canonical call (JWT-based). No x-admin-secret header.
+      const res = await adminSendNotificationCampaign(payload);
 
       setStatusMsg(
         `Campaign sent. Recipients: ${
-          data?.recipient_count ?? "—"
-        }. Campaign ID: ${data?.campaign_id ?? "—"}`
+          res.recipient_count ?? "—"
+        }. Campaign ID: ${res.campaign_id ?? "—"}`
       );
 
       setBody("");
@@ -524,7 +507,7 @@ export default function AdminSendNotificationPage() {
             </div>
           </div>
 
-          {/* Raffle targeting (replaces manual ID entry with search + pick) */}
+          {/* Raffle targeting */}
           <div className="space-y-2">
             {showRafflePicker ? (
               <>
@@ -597,7 +580,6 @@ export default function AdminSendNotificationPage() {
                   }
                 />
 
-                {/* Keep the actual raffleId visible for debugging/copy, but not required to type */}
                 <div
                   className="rounded-lg border px-3 py-2 text-xs"
                   style={{
@@ -646,7 +628,6 @@ export default function AdminSendNotificationPage() {
               </>
             ) : (
               <>
-                {/* Multi raffle union stays as-is (it is inherently multi-ID), but we polish the copy */}
                 {mode === "multi_raffle_union" ? (
                   <div className="space-y-2">
                     <label
@@ -665,7 +646,7 @@ export default function AdminSendNotificationPage() {
                         color: COLORS.textPrimary,
                         minHeight: 90,
                       }}
-                      placeholder="uuid1&#10;uuid2&#10;uuid3"
+                      placeholder={"uuid1\nuuid2\nuuid3"}
                     />
                     <div
                       className="text-xs"
@@ -789,7 +770,7 @@ export default function AdminSendNotificationPage() {
                   color: COLORS.textPrimary,
                   minHeight: 140,
                 }}
-                placeholder="uuid1&#10;uuid2&#10;uuid3"
+                placeholder={"uuid1\nuuid2\nuuid3"}
               />
               <div className="text-xs" style={{ color: COLORS.textMuted }}>
                 Total recipients (selected + manual):{" "}
