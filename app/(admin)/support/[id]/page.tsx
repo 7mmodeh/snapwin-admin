@@ -6,6 +6,9 @@ import { useParams, useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import { COLORS } from "@/lib/colors";
 
+/* ---------------------------
+   TYPES
+---------------------------- */
 type SupportRequestDetail = {
   id: string;
   customer_name: string | null;
@@ -52,6 +55,109 @@ type LocalAdminMessage = {
   delivery: LocalDeliveryState;
 };
 
+// Combined message type for rendering (server + local)
+type CombinedMessage =
+  | {
+      kind: "server";
+      id: string;
+      sender_type: string;
+      sender_email: string | null;
+      sender_name: string | null;
+      message: string;
+      created_at: string;
+    }
+  | {
+      kind: "local";
+      id: string;
+      sender_type: "admin";
+      sender_email: null;
+      sender_name: "Admin";
+      message: string;
+      created_at: string;
+      delivery: LocalDeliveryState;
+    };
+
+// Helpers to safely read unknown payloads
+type DbRow = Record<string, unknown>;
+
+function asString(v: unknown): string {
+  if (typeof v === "string") return v;
+  if (v == null) return "";
+  return String(v);
+}
+
+function asNullableString(v: unknown): string | null {
+  if (v == null) return null;
+  if (typeof v === "string") return v;
+  return String(v);
+}
+
+function asNullableNumber(v: unknown): number | null {
+  if (v == null) return null;
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = parseInt(v, 10);
+    return Number.isNaN(n) ? null : n;
+  }
+  return null;
+}
+
+function normStatus(s: string | null | undefined) {
+  return (s ?? "").trim().toLowerCase();
+}
+
+function normalizeSupportMessageRow(input: unknown): SupportMessageRow | null {
+  if (!input || typeof input !== "object") return null;
+  const o = input as DbRow;
+
+  const id = asString(o.id);
+  if (!id) return null;
+
+  return {
+    id,
+    sender_type: asString(o.sender_type),
+    sender_email: asNullableString(o.sender_email),
+    sender_name: asNullableString(o.sender_name),
+    message: asString(o.message),
+    created_at: asString(o.created_at) || new Date().toISOString(),
+  };
+}
+
+function normalizeSupportRequestPatch(
+  input: unknown
+): Partial<SupportRequestDetail> | null {
+  if (!input || typeof input !== "object") return null;
+  const o = input as DbRow;
+
+  // require id to apply patch reliably
+  const id = asNullableString(o.id);
+  if (!id) return null;
+
+  const patch: Partial<SupportRequestDetail> = { id };
+
+  if ("customer_name" in o)
+    patch.customer_name = asNullableString(o.customer_name);
+  if ("customer_email" in o)
+    patch.customer_email = asNullableString(o.customer_email);
+  if ("customer_phone" in o)
+    patch.customer_phone = asNullableString(o.customer_phone);
+  if ("customer_county" in o)
+    patch.customer_county = asNullableString(o.customer_county);
+  if ("topic" in o) patch.topic = asNullableString(o.topic);
+  if ("issue_type" in o) patch.issue_type = asString(o.issue_type);
+  if ("raffle_id" in o) patch.raffle_id = asNullableString(o.raffle_id);
+  if ("raffle_item_name" in o)
+    patch.raffle_item_name = asNullableString(o.raffle_item_name);
+  if ("ticket_id" in o) patch.ticket_id = asNullableString(o.ticket_id);
+  if ("ticket_number" in o)
+    patch.ticket_number = asNullableNumber(o.ticket_number);
+  if ("status" in o) patch.status = asString(o.status);
+  if ("created_at" in o) patch.created_at = asString(o.created_at);
+  if ("updated_at" in o) patch.updated_at = asString(o.updated_at);
+
+  return patch;
+}
+
 function makeLocalId() {
   const s = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
     const r = (Math.random() * 16) | 0;
@@ -61,6 +167,9 @@ function makeLocalId() {
   return `local:${s}`;
 }
 
+/* ---------------------------
+   PAGE
+---------------------------- */
 export default function SupportDetailPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
@@ -80,8 +189,9 @@ export default function SupportDetailPage() {
   const typingChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(
     null
   );
-  const myStopTimerRef = useRef<any>(null);
-  const clearOtherTimerRef = useRef<any>(null);
+
+  const myStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearOtherTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Delivery state
   const [localAdminMessages, setLocalAdminMessages] = useState<
@@ -100,7 +210,14 @@ export default function SupportDetailPage() {
     el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "auto" });
   };
 
+  const isClosed = normStatus(request?.status) === "closed";
+  const replyDisabledReason = isClosed
+    ? "This support request is closed. Chat is disabled."
+    : null;
+
   useEffect(() => {
+    let mounted = true;
+
     const fetchDetail = async () => {
       try {
         if (!requestId) return;
@@ -127,33 +244,46 @@ export default function SupportDetailPage() {
 
         if (reqRes.error) throw reqRes.error;
         if (!reqRes.data) {
+          if (!mounted) return;
           setError("Support request not found.");
           setLoading(false);
           return;
         }
         if (msgsRes.error) throw msgsRes.error;
 
+        if (!mounted) return;
+
         setRequest(reqRes.data);
         setMessages((msgsRes.data ?? []) as SupportMessageRow[]);
 
-        const lowerStatus = (reqRes.data.status || "").toLowerCase();
+        const lowerStatus = normStatus(reqRes.data.status);
         if (STATUS_OPTIONS.includes(lowerStatus as StatusOption)) {
           setStatusDraft(lowerStatus as StatusOption);
         } else {
           setStatusDraft("open");
         }
 
+        if (lowerStatus === "closed") {
+          setReply("");
+          setLocalAdminMessages([]);
+          setCustomerIsTyping(false);
+        }
+
         requestAnimationFrame(() => scrollToBottom(false));
       } catch (err: unknown) {
         console.error("Error loading support request:", err);
+        if (!mounted) return;
         if (err instanceof Error) setError(err.message);
         else setError("Failed to load support request.");
       } finally {
-        setLoading(false);
+        if (mounted) setLoading(false);
       }
     };
 
     fetchDetail();
+    return () => {
+      mounted = false;
+    };
   }, [requestId]);
 
   // ✅ Realtime: new messages in this request
@@ -171,11 +301,11 @@ export default function SupportDetailPage() {
           filter: `request_id=eq.${requestId}`,
         },
         (payload) => {
-          const row = payload.new as any;
+          const row = normalizeSupportMessageRow(payload.new);
+          if (!row) return;
 
           setMessages((prev) => {
-            const next = [...prev, row as SupportMessageRow];
-            // de-dupe
+            const next = [...prev, row];
             const seen = new Set<string>();
             return next.filter((m) => {
               if (seen.has(m.id)) return false;
@@ -189,12 +319,12 @@ export default function SupportDetailPage() {
             if (!prev.length) return prev;
             const next = prev.filter((lm) => {
               const matchBody =
-                (row?.message || "").trim() === (lm.message || "").trim();
+                (row.message || "").trim() === (lm.message || "").trim();
               if (!matchBody) return true;
 
-              const tServer = new Date(row?.created_at || Date.now()).getTime();
+              const tServer = new Date(row.created_at || Date.now()).getTime();
               const tLocal = new Date(lm.created_at).getTime();
-              return Math.abs(tServer - tLocal) > 5000; // keep if not near-time match
+              return Math.abs(tServer - tLocal) > 5000;
             });
             return next;
           });
@@ -224,8 +354,44 @@ export default function SupportDetailPage() {
           filter: `id=eq.${requestId}`,
         },
         (payload) => {
-          const row = payload.new as any;
-          setRequest((prev) => (prev ? { ...prev, ...row } : prev));
+          const patch = normalizeSupportRequestPatch(payload.new);
+          if (!patch) return;
+
+          setRequest((prev) => {
+            if (!prev) return prev;
+            const next = { ...prev, ...patch };
+
+            if (normStatus(next.status) === "closed") {
+              setReply("");
+              setLocalAdminMessages([]);
+              setCustomerIsTyping(false);
+
+              if (myStopTimerRef.current) {
+                clearTimeout(myStopTimerRef.current);
+                myStopTimerRef.current = null;
+              }
+
+              try {
+                const ch = typingChannelRef.current;
+                if (ch) {
+                  ch.send({
+                    type: "broadcast",
+                    event: "typing",
+                    payload: {
+                      request_id: requestId,
+                      from: "admin",
+                      isTyping: false,
+                      at: Date.now(),
+                    } satisfies TypingPayload,
+                  });
+                }
+              } catch {
+                // no-op
+              }
+            }
+
+            return next;
+          });
         }
       )
       .subscribe();
@@ -240,19 +406,35 @@ export default function SupportDetailPage() {
     if (!requestId) return;
 
     setCustomerIsTyping(false);
-    if (myStopTimerRef.current) clearTimeout(myStopTimerRef.current);
-    if (clearOtherTimerRef.current) clearTimeout(clearOtherTimerRef.current);
+
+    if (myStopTimerRef.current) {
+      clearTimeout(myStopTimerRef.current);
+      myStopTimerRef.current = null;
+    }
+    if (clearOtherTimerRef.current) {
+      clearTimeout(clearOtherTimerRef.current);
+      clearOtherTimerRef.current = null;
+    }
 
     const channel = supabase.channel(`typing-support:${requestId}`, {
       config: { broadcast: { self: false } },
     });
 
     channel.on("broadcast", { event: "typing" }, ({ payload }) => {
-      const p = payload as TypingPayload;
-      if (!p || p.request_id !== requestId) return;
-      if (p.from !== "customer") return;
+      const p = payload as unknown;
 
-      if (p.isTyping) {
+      if (!p || typeof p !== "object") return;
+      const o = p as Record<string, unknown>;
+
+      const rid = asString(o.request_id);
+      const from = asString(o.from);
+      const isTyping = Boolean(o.isTyping);
+
+      if (rid !== requestId) return;
+      if (from !== "customer") return;
+      if (normStatus(request?.status) === "closed") return;
+
+      if (isTyping) {
         setCustomerIsTyping(true);
         if (clearOtherTimerRef.current)
           clearTimeout(clearOtherTimerRef.current);
@@ -279,20 +461,29 @@ export default function SupportDetailPage() {
             at: Date.now(),
           } satisfies TypingPayload,
         });
-      } catch {}
+      } catch {
+        // no-op
+      }
 
-      if (myStopTimerRef.current) clearTimeout(myStopTimerRef.current);
-      if (clearOtherTimerRef.current) clearTimeout(clearOtherTimerRef.current);
+      if (myStopTimerRef.current) {
+        clearTimeout(myStopTimerRef.current);
+        myStopTimerRef.current = null;
+      }
+      if (clearOtherTimerRef.current) {
+        clearTimeout(clearOtherTimerRef.current);
+        clearOtherTimerRef.current = null;
+      }
 
       supabase.removeChannel(channel);
       typingChannelRef.current = null;
       setCustomerIsTyping(false);
     };
-  }, [requestId]);
+  }, [requestId, request?.status]);
 
   const emitAdminTyping = (isTyping: boolean) => {
     const ch = typingChannelRef.current;
     if (!ch || !requestId) return;
+    if (normStatus(request?.status) === "closed") return;
 
     ch.send({
       type: "broadcast",
@@ -307,11 +498,19 @@ export default function SupportDetailPage() {
   };
 
   const onReplyChanged = (val: string) => {
+    if (isClosed) {
+      setReply("");
+      return;
+    }
+
     setReply(val);
 
     const hasText = !!val.trim();
     if (!hasText) {
-      if (myStopTimerRef.current) clearTimeout(myStopTimerRef.current);
+      if (myStopTimerRef.current) {
+        clearTimeout(myStopTimerRef.current);
+        myStopTimerRef.current = null;
+      }
       emitAdminTyping(false);
       return;
     }
@@ -325,7 +524,10 @@ export default function SupportDetailPage() {
   };
 
   const stopTypingNow = () => {
-    if (myStopTimerRef.current) clearTimeout(myStopTimerRef.current);
+    if (myStopTimerRef.current) {
+      clearTimeout(myStopTimerRef.current);
+      myStopTimerRef.current = null;
+    }
     emitAdminTyping(false);
   };
 
@@ -337,10 +539,12 @@ export default function SupportDetailPage() {
       setError(null);
       setSuccess(null);
 
+      const nextStatus = statusDraft;
+
       const { error: updateError } = await supabase
         .from("support_requests")
         .update({
-          status: statusDraft,
+          status: nextStatus,
           updated_at: new Date().toISOString(),
         })
         .eq("id", request.id);
@@ -351,11 +555,18 @@ export default function SupportDetailPage() {
         prev
           ? {
               ...prev,
-              status: statusDraft,
+              status: nextStatus,
               updated_at: new Date().toISOString(),
             }
           : prev
       );
+
+      if (nextStatus === "closed") {
+        stopTypingNow();
+        setReply("");
+        setLocalAdminMessages([]);
+        setCustomerIsTyping(false);
+      }
 
       setSuccess("Status updated successfully.");
     } catch (err: unknown) {
@@ -369,6 +580,10 @@ export default function SupportDetailPage() {
 
   const insertAdminReply = async (text: string) => {
     if (!request) throw new Error("No request loaded.");
+    if (normStatus(request.status) === "closed") {
+      throw new Error("This support request is closed. Replies are disabled.");
+    }
+
     const trimmed = text.trim();
     if (!trimmed) return null;
 
@@ -396,6 +611,13 @@ export default function SupportDetailPage() {
 
   const handleSendReply = async () => {
     if (!request) return;
+
+    if (normStatus(request.status) === "closed") {
+      setError("This support request is closed. Chat is disabled.");
+      setReply("");
+      return;
+    }
+
     const text = reply.trim();
     if (!text) return;
 
@@ -420,11 +642,9 @@ export default function SupportDetailPage() {
 
       await insertAdminReply(text);
 
-      // On success: remove local bubble.
       setLocalAdminMessages((prev) =>
         prev.filter((m) => m.local_id !== localId)
       );
-
       setSuccess("Reply sent.");
     } catch (err: unknown) {
       console.error("Error sending reply:", err);
@@ -442,6 +662,12 @@ export default function SupportDetailPage() {
   };
 
   const retryLocal = async (local_id: string) => {
+    if (normStatus(request?.status) === "closed") {
+      setError("This support request is closed. Chat is disabled.");
+      setLocalAdminMessages([]);
+      return;
+    }
+
     const lm = localAdminMessages.find((m) => m.local_id === local_id);
     if (!lm) return;
 
@@ -470,17 +696,17 @@ export default function SupportDetailPage() {
       );
 
       if (err instanceof Error) setError(err.message);
-      else setError("Failed to load support request.");
+      else setError("Failed to send reply.");
     }
   };
 
-  // ✅ FIX: Hooks must always run. So we compute memoized values BEFORE any early returns.
+  // ✅ Hooks must always run: compute memoized values before early returns
   const customerName =
     request?.customer_name || request?.customer_email || "Unknown customer";
 
-  const combinedMessages = useMemo(() => {
-    const server = (messages ?? []).map((m) => ({
-      kind: "server" as const,
+  const combinedMessages: CombinedMessage[] = useMemo(() => {
+    const server: CombinedMessage[] = (messages ?? []).map((m) => ({
+      kind: "server",
       id: m.id,
       sender_type: m.sender_type,
       sender_email: m.sender_email,
@@ -489,22 +715,25 @@ export default function SupportDetailPage() {
       created_at: m.created_at,
     }));
 
-    const locals = (localAdminMessages ?? []).map((m) => ({
-      kind: "local" as const,
-      id: m.local_id,
-      sender_type: "admin",
-      sender_email: null,
-      sender_name: "Admin",
-      message: m.message,
-      created_at: m.created_at,
-      delivery: m.delivery,
-    }));
+    const locals: CombinedMessage[] =
+      normStatus(request?.status) === "closed"
+        ? []
+        : (localAdminMessages ?? []).map((m) => ({
+            kind: "local",
+            id: m.local_id,
+            sender_type: "admin",
+            sender_email: null,
+            sender_name: "Admin",
+            message: m.message,
+            created_at: m.created_at,
+            delivery: m.delivery,
+          }));
 
     return [...server, ...locals].sort(
       (a, b) =>
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
     );
-  }, [messages, localAdminMessages]);
+  }, [messages, localAdminMessages, request?.status]);
 
   if (loading) {
     return (
@@ -571,6 +800,17 @@ export default function SupportDetailPage() {
           </span>
         </div>
       </div>
+
+      {/* Closed banner */}
+      {isClosed && (
+        <div
+          className="rounded px-4 py-3 text-sm"
+          style={{ backgroundColor: "#FEF3C7", color: COLORS.textPrimary }}
+        >
+          <b>Closed:</b> This support request is closed. The chat thread is
+          locked and no more replies can be sent.
+        </div>
+      )}
 
       {/* Alerts */}
       {success && (
@@ -716,7 +956,7 @@ export default function SupportDetailPage() {
             Conversation
           </h2>
 
-          {customerIsTyping && (
+          {!isClosed && customerIsTyping && (
             <div
               className="text-xs font-semibold px-3 py-1 rounded-full"
               style={{
@@ -737,15 +977,13 @@ export default function SupportDetailPage() {
           <div
             ref={scrollRef}
             className="space-y-3 max-h-[420px] overflow-y-auto pr-1"
-            onLoad={() => scrollToBottom(false)}
           >
             {combinedMessages.map((msg) => (
               <MessageBubble
-                key={msg.id}
-                msg={msg as any}
+                key={`${msg.kind}:${msg.id}`}
+                msg={msg}
                 onRetry={
-                  (msg as any).kind === "local" &&
-                  (msg as any).delivery === "failed"
+                  msg.kind === "local" && msg.delivery === "failed"
                     ? () => retryLocal(msg.id)
                     : undefined
                 }
@@ -770,30 +1008,43 @@ export default function SupportDetailPage() {
             value={reply}
             onChange={(e) => onReplyChanged(e.target.value)}
             rows={3}
+            disabled={isClosed || sendingReply}
             className="w-full border rounded px-3 py-2 text-sm"
             style={{
               borderColor: COLORS.inputBorder,
-              backgroundColor: COLORS.inputBg,
+              backgroundColor: isClosed
+                ? COLORS.highlightCardBg
+                : COLORS.inputBg,
               color: COLORS.textPrimary,
+              opacity: isClosed ? 0.7 : 1,
+              cursor: isClosed ? "not-allowed" : "text",
             }}
-            placeholder="Type your reply to the customer..."
+            placeholder={
+              replyDisabledReason ?? "Type your reply to the customer..."
+            }
           />
 
           <div className="flex items-center justify-between mt-2">
             <div className="text-xs" style={{ color: COLORS.textMuted }}>
-              {sendingReply ? "Sending…" : " "}
+              {isClosed
+                ? "Chat is locked (closed)."
+                : sendingReply
+                ? "Sending…"
+                : " "}
             </div>
 
             <button
               type="button"
               onClick={handleSendReply}
-              disabled={sendingReply || !reply.trim()}
+              disabled={isClosed || sendingReply || !reply.trim()}
               className="px-4 py-2 rounded text-sm font-medium"
               style={{
                 backgroundColor: COLORS.primaryButtonBg,
                 color: COLORS.primaryButtonText,
-                opacity: sendingReply || !reply.trim() ? 0.7 : 1,
+                opacity: isClosed || sendingReply || !reply.trim() ? 0.5 : 1,
+                cursor: isClosed ? "not-allowed" : "pointer",
               }}
+              title={replyDisabledReason ?? undefined}
             >
               {sendingReply ? "Sending..." : "Send reply"}
             </button>
@@ -804,6 +1055,9 @@ export default function SupportDetailPage() {
   );
 }
 
+/* ---------------------------
+   UI COMPONENTS
+---------------------------- */
 function DetailRow({ label, value }: { label: string; value: string }) {
   return (
     <div>
@@ -821,7 +1075,7 @@ function DetailRow({ label, value }: { label: string; value: string }) {
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const lower = (status || "").toLowerCase();
+  const lower = normStatus(status);
   let bg = COLORS.info;
   let label = status || "—";
 
@@ -854,20 +1108,10 @@ function MessageBubble({
   msg,
   onRetry,
 }: {
-  msg: {
-    kind?: "server" | "local";
-    id: string;
-    sender_type: string;
-    sender_email: string | null;
-    sender_name: string | null;
-    message: string;
-    created_at: string;
-    delivery?: "sending" | "failed";
-  };
+  msg: CombinedMessage;
   onRetry?: () => void;
 }) {
-  const isAdmin = (msg.sender_type || "").toLowerCase() === "admin";
-
+  const isAdmin = normStatus(msg.sender_type) === "admin";
   const alignClass = isAdmin ? "items-end text-right" : "items-start text-left";
 
   const bubbleStyle = isAdmin
@@ -885,21 +1129,20 @@ function MessageBubble({
       };
 
   const name =
-    msg.sender_name || (isAdmin ? "Admin" : msg.sender_email || "Customer");
-
-  const isLocal = msg.kind === "local";
-  const delivery = msg.delivery;
+    msg.kind === "local"
+      ? "Admin"
+      : msg.sender_name || (isAdmin ? "Admin" : msg.sender_email || "Customer");
 
   return (
     <div className={`flex flex-col ${alignClass} gap-1`}>
       <div className="text-[0.7rem]" style={{ color: COLORS.textSecondary }}>
         {name} · {new Date(msg.created_at).toLocaleString("en-IE")}
-        {isLocal && delivery === "sending" && (
+        {msg.kind === "local" && msg.delivery === "sending" && (
           <span style={{ marginLeft: 8, color: COLORS.textMuted }}>
             • Sending…
           </span>
         )}
-        {isLocal && delivery === "failed" && (
+        {msg.kind === "local" && msg.delivery === "failed" && (
           <span style={{ marginLeft: 8, color: COLORS.error }}>• Failed</span>
         )}
       </div>
@@ -911,7 +1154,7 @@ function MessageBubble({
         {msg.message}
       </div>
 
-      {isLocal && delivery === "failed" && (
+      {msg.kind === "local" && msg.delivery === "failed" && (
         <button
           type="button"
           onClick={onRetry}
